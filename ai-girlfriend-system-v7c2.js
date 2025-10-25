@@ -1487,6 +1487,16 @@ async function initializeCompleteDatabase() {
       console.log(`✅ Created index: ${query.substring(0, 80)}...`);
     }
 
+    // Drop and recreate views to ensure schema changes are applied cleanly
+    const dropViewQueries = [
+      "DROP VIEW IF EXISTS active_user_relationships"
+    ];
+
+    for (const query of dropViewQueries) {
+      await dbPool.query(query);
+      console.log(`✅ Dropped view (if existed): ${query}`);
+    }
+
     // Create views
     const viewQueries = [
       `CREATE OR REPLACE VIEW active_user_relationships AS
