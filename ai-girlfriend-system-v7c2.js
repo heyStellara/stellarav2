@@ -296,6 +296,401 @@ console.log('🗃️ Standard memory keys initialized');
 
 // ==================== COST TRACKING SYSTEM ====================
 
+class WhatsAppMemoryBridge {
+  constructor(pool, memoryCacheRef) {
+    this.pool = pool;
+    this.memoryCache = memoryCacheRef;
+    this.contextCache = new NodeCache({ stdTTL: 90, checkperiod: 60, useClones: false });
+    this.CONTEXT_LIMIT = 12;
+  }
+
+  buildCacheKey(userPhone, botName) {
+    return `ctx:${userPhone}:${botName}`;
+  }
+
+  async getRecentContext(userPhone, botName, limit = 6) {
+    const cacheKey = this.buildCacheKey(userPhone, botName);
+    const cached = this.contextCache.get(cacheKey);
+    if (cached && cached.length >= Math.min(limit, this.CONTEXT_LIMIT)) {
+      return cached.slice(0, limit);
+    }
+
+    try {
+      const { rows } = await this.pool.query(
+        `SELECT user_message, bot_response, message_type, created_at, delivery_status, metadata, template_name
+         FROM conversation_messages
+         WHERE user_phone = $1 AND bot_name = $2
+         ORDER BY created_at DESC
+         LIMIT $3`,
+        [userPhone, botName, Math.max(limit, this.CONTEXT_LIMIT)]
+      );
+
+      const normalized = rows.map(row => ({
+        user_message: row.user_message,
+        bot_response: row.bot_response,
+        message_type: row.message_type,
+        created_at: row.created_at,
+        delivery_status: row.delivery_status,
+        metadata: typeof row.metadata === 'object' ? row.metadata : (row.metadata ? JSON.parse(row.metadata) : null),
+        template_name: row.template_name || null
+      }));
+
+      this.contextCache.set(cacheKey, normalized);
+      return normalized.slice(0, limit);
+    } catch (error) {
+      console.error('WhatsAppMemoryBridge#getRecentContext error:', error);
+      return [];
+    }
+  }
+
+  async registerExchange({ userPhone, botName, incoming, outgoing, deliveryStatus }) {
+    const cacheKey = this.buildCacheKey(userPhone, botName);
+    const cached = this.contextCache.get(cacheKey) || [];
+    const record = {
+      user_message: incoming?.text || null,
+      bot_response: outgoing?.text || null,
+      message_type: outgoing?.type || incoming?.type || 'text',
+      created_at: new Date().toISOString(),
+      delivery_status: deliveryStatus || null,
+      metadata: {
+        incomingMessageId: incoming?.id || null,
+        outgoingMessageId: outgoing?.id || null,
+        incomingType: incoming?.type || null,
+        outgoingType: outgoing?.type || null,
+        templateName: outgoing?.templateName || null
+      },
+      template_name: outgoing?.templateName || null
+    };
+
+    const updated = [record, ...cached].slice(0, this.CONTEXT_LIMIT);
+    this.contextCache.set(cacheKey, updated);
+
+    if (this.memoryCache) {
+      this.memoryCache.set(`${userPhone}:${botName}:recent_context`, { exchanges: updated, timestamp: Date.now() });
+    }
+  }
+
+  async getToneSnapshot(userPhone, botName) {
+    const context = await this.getRecentContext(userPhone, botName, 6);
+    const botLines = context.map(item => item.bot_response).filter(Boolean);
+    const averageLength = botLines.length
+      ? botLines.reduce((sum, line) => sum + line.length, 0) / botLines.length
+      : 0;
+    const excitementRatio = botLines.length
+      ? botLines.filter(line => /!/.test(line)).length / botLines.length
+      : 0;
+    const affectionRatio = botLines.length
+      ? botLines.filter(line => /❤️|💕|💖|😘|😍/.test(line)).length / botLines.length
+      : 0;
+
+    return {
+      averageLength,
+      excitementRatio,
+      affectionRatio,
+      sample: botLines.slice(0, 3)
+    };
+  }
+}
+
+class PersonalityConsistencyEngine {
+  constructor(pool) {
+    this.pool = pool;
+    this.toneCache = new NodeCache({ stdTTL: 600, checkperiod: 120, useClones: false });
+  }
+
+  async harmonizeResponse(botName, response, context = {}) {
+    if (!response) return response;
+    const baseline = await this.getBaselineTone(botName);
+    const adjustments = this.deriveAdjustments(baseline, context);
+    return this.applyAdjustments(response, adjustments);
+  }
+
+  async getBaselineTone(botName) {
+    const cacheKey = `tone:${botName}`;
+    const cached = this.toneCache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    let baseline = { warmth: 0.6, playfulness: 0.5, formality: 0.3, flirtatiousness: 0.5 };
+    try {
+      const { rows } = await this.pool.query(
+        'SELECT personality, romantic_expressions, mood_indicators FROM bots WHERE bot_name = $1 LIMIT 1',
+        [botName]
+      );
+
+      if (rows[0]) {
+        baseline = this.analyzeTone(rows[0]);
+      }
+    } catch (error) {
+      console.error('Personality baseline lookup error:', error);
+    }
+
+    this.toneCache.set(cacheKey, baseline);
+    return baseline;
+  }
+
+  analyzeTone(botRow) {
+    const romanticExpressions = Array.isArray(botRow.romantic_expressions)
+      ? botRow.romantic_expressions.join(' ')
+      : '';
+    const moodIndicators = Array.isArray(botRow.mood_indicators)
+      ? botRow.mood_indicators.join(' ')
+      : '';
+    const combined = `${botRow.personality || ''} ${romanticExpressions} ${moodIndicators}`.toLowerCase();
+
+    const countMatches = (terms) => terms.reduce((score, term) => score + (combined.includes(term) ? 1 : 0), 0);
+
+    return {
+      warmth: Math.min(1, 0.4 + countMatches(['loving', 'caring', 'sweet', 'devoted', 'romantic']) * 0.12),
+      playfulness: Math.min(1, 0.3 + countMatches(['playful', 'cheeky', 'tease', 'fun', 'mischievous']) * 0.12),
+      formality: Math.min(1, 0.25 + countMatches(['poised', 'elegant', 'professional', 'composed']) * 0.15),
+      flirtatiousness: Math.min(1, 0.35 + countMatches(['flirt', 'sultry', 'seductive', 'tempting']) * 0.12)
+    };
+  }
+
+  deriveAdjustments(baseline, context) {
+    const adjustments = {
+      maintainFormality: baseline.formality > 0.55,
+      encourageAffection: baseline.warmth > 0.6,
+      boostPlayfulness: baseline.playfulness > 0.6,
+      softenIfLowMood: false
+    };
+
+    const recent = context.recentMessages || [];
+    const botLines = recent.map(entry => entry.bot_response).filter(Boolean);
+    if (botLines.length) {
+      const affectionRatio = botLines.filter(line => /❤️|💕|💖|😘|😍/.test(line)).length / botLines.length;
+      if (affectionRatio < 0.3 && baseline.warmth > 0.6) {
+        adjustments.encourageAffection = true;
+      }
+
+      const exclamationRatio = botLines.filter(line => /!/.test(line)).length / botLines.length;
+      if (exclamationRatio < 0.25 && baseline.playfulness > 0.6) {
+        adjustments.boostPlayfulness = true;
+      }
+      if (exclamationRatio > 0.7 && context.userMood === 'calm') {
+        adjustments.boostPlayfulness = false;
+      }
+    }
+
+    const messageText = context.messageText || '';
+    if (/sad|tired|exhausted|lonely|depressed|down/i.test(messageText)) {
+      adjustments.softenIfLowMood = true;
+      adjustments.boostPlayfulness = false;
+    }
+
+    return adjustments;
+  }
+
+  applyAdjustments(response, adjustments) {
+    let adjusted = response.trim();
+
+    if (adjustments.maintainFormality) {
+      adjusted = adjusted.replace(/\b(hey|ya|yo|lol)\b/gi, (match) => {
+        if (match.toLowerCase() === 'hey') return 'Hi';
+        return '';
+      }).replace(/\s{2,}/g, ' ').trim();
+    }
+
+    if (adjustments.softenIfLowMood) {
+      adjusted = adjusted.replace(/!/g, '.');
+      if (!/[❤️💕💖😘😍]/.test(adjusted)) {
+        adjusted += adjusted.endsWith('.') ? ' ❤️' : ' ❤️';
+      }
+    } else if (adjustments.boostPlayfulness && !/!$/.test(adjusted)) {
+      adjusted += '!';
+    }
+
+    if (adjustments.encourageAffection && !/[❤️💕💖😘😍]/.test(adjusted)) {
+      adjusted += ' 💕';
+    }
+
+    return adjusted;
+  }
+}
+
+class WhatsAppTemplateManager {
+  constructor(pool) {
+    this.pool = pool;
+    this.cache = new NodeCache({ stdTTL: 300, checkperiod: 120, useClones: false });
+  }
+
+  async composeTemplateMessage(botName, userPhone, campaignType, context = {}) {
+    const templates = await this.getTemplatesByType(campaignType);
+    if (!templates.length) {
+      return null;
+    }
+
+    const template = this.selectTemplate(templates);
+    const variableRecords = await this.getTemplateVariables(template.template_name);
+    const values = this.buildVariableMap(template, variableRecords, context, botName, userPhone);
+    const text = this.fillTemplateBody(template.body, values);
+
+    return {
+      text,
+      templateName: template.template_name,
+      variablesUsed: values
+    };
+  }
+
+  async getTemplatesByType(campaignType) {
+    const cacheKey = `templates:${campaignType}`;
+    const cached = this.cache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    try {
+      const { rows } = await this.pool.query(
+        `SELECT template_name, campaign_type, language, body, variables, priority, usage_count
+         FROM whatsapp_templates
+         WHERE is_active = true AND campaign_type = $1
+         ORDER BY priority ASC, usage_count ASC`,
+        [campaignType]
+      );
+      this.cache.set(cacheKey, rows);
+      return rows;
+    } catch (error) {
+      console.error('Template fetch error:', error);
+      return [];
+    }
+  }
+
+  selectTemplate(templates) {
+    if (!templates.length) return null;
+    const sorted = [...templates].sort((a, b) => {
+      const priorityDiff = (a.priority ?? 100) - (b.priority ?? 100);
+      if (priorityDiff !== 0) return priorityDiff;
+      return (a.usage_count ?? 0) - (b.usage_count ?? 0);
+    });
+    const topSet = sorted.slice(0, Math.min(sorted.length, 3));
+    return topSet[Math.floor(Math.random() * topSet.length)];
+  }
+
+  async getTemplateVariables(templateName) {
+    const cacheKey = `templateVars:${templateName}`;
+    const cached = this.cache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    try {
+      const { rows } = await this.pool.query(
+        `SELECT variable_name, default_value FROM template_variables WHERE template_name = $1`,
+        [templateName]
+      );
+      this.cache.set(cacheKey, rows, 600);
+      return rows;
+    } catch (error) {
+      console.error('Template variable fetch error:', error);
+      return [];
+    }
+  }
+
+  buildVariableMap(template, variableRecords, context, botName, userPhone) {
+    const valueMap = {
+      bot_name: botName,
+      user_phone: userPhone
+    };
+
+    if (context.userName) {
+      valueMap.user_name = context.userName;
+    }
+
+    const memories = context.memories || [];
+    if (!valueMap.user_name) {
+      const memoryName = memories.find(mem => (mem.memory_key && mem.memory_key.includes('user_name')) || (mem.memory_type && mem.memory_type.includes('user_name')));
+      if (memoryName?.memory_value) {
+        valueMap.user_name = memoryName.memory_value;
+      }
+    }
+
+    if (!valueMap.user_name) {
+      valueMap.user_name = 'love';
+    }
+
+    const normalizedTemplateVars = this.normalizeTemplateVariables(template.variables);
+    normalizedTemplateVars.forEach(varName => {
+      if (valueMap[varName] === undefined && context.variables?.[varName] !== undefined) {
+        valueMap[varName] = context.variables[varName];
+      }
+    });
+
+    for (const record of variableRecords) {
+      const key = record.variable_name.trim();
+      if (valueMap[key] !== undefined) continue;
+      if (context.variables && context.variables[key] !== undefined) {
+        valueMap[key] = context.variables[key];
+      } else if (context[key] !== undefined) {
+        valueMap[key] = context[key];
+      } else {
+        valueMap[key] = record.default_value || '';
+      }
+    }
+
+    return valueMap;
+  }
+
+  normalizeTemplateVariables(variables) {
+    if (!variables) return [];
+    if (Array.isArray(variables)) return variables;
+    if (typeof variables === 'string') {
+      try {
+        const parsed = JSON.parse(variables);
+        if (Array.isArray(parsed)) return parsed;
+        if (parsed && typeof parsed === 'object') return Object.keys(parsed);
+      } catch (error) {
+        // Ignore JSON parse errors
+      }
+      return [];
+    }
+    if (typeof variables === 'object') {
+      return Object.keys(variables);
+    }
+    return [];
+  }
+
+  fillTemplateBody(body, values) {
+    return body.replace(/{{\s*([\w_]+)\s*}}/g, (match, key) => {
+      const normalizedKey = key.trim();
+      const value = values[normalizedKey];
+      return value !== undefined && value !== null ? value : '';
+    });
+  }
+
+  async recordUsage(templateName, campaignType) {
+    if (!templateName) return;
+    try {
+      await this.pool.query(
+        `UPDATE whatsapp_templates SET usage_count = COALESCE(usage_count, 0) + 1, last_used_at = NOW() WHERE template_name = $1`,
+        [templateName]
+      );
+      this.cache.del(`templates:${campaignType}`);
+    } catch (error) {
+      console.error('Template usage update error:', error);
+    }
+  }
+
+  async recordDelivery(userPhone, botName, campaignType, templateName, metadata = {}) {
+    try {
+      await this.pool.query(
+        `INSERT INTO engagement_metrics (user_phone, bot_name, metric_type, metric_value, metadata, recorded_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())`,
+        [
+          userPhone,
+          botName,
+          'proactive_delivery',
+          templateName || campaignType,
+          JSON.stringify({ campaignType, templateName, ...metadata })
+        ]
+      );
+    } catch (error) {
+      console.error('Engagement metric logging error:', error);
+    }
+  }
+}
+
 let dailyApiCalls = { cheap: 0, premium: 0, date: new Date().toDateString() };
 
 function trackApiCall(model) {
@@ -325,20 +720,24 @@ function trackApiCall(model) {
 // Store conversation in unified schema format
 async function storeConversationUnified(userPhone, botName, userMessage, botResponse, options = {}) {
   try {
-    console.log('📝 Storing unified conversation:', { 
-      userPhone, 
-      botName, 
-      userMessage: userMessage?.substring(0, 50) || '[PROACTIVE]', 
+    console.log('📝 Storing unified conversation:', {
+      userPhone,
+      botName,
+      userMessage: userMessage?.substring(0, 50) || '[PROACTIVE]',
       botResponse: botResponse?.substring(0, 50),
-      messageType: options.messageType || 'text'
+      messageType: options.messageType || 'text',
+      whatsappMessageId: options.whatsappMessageId,
+      direction: options.direction,
+      deliveryStatus: options.deliveryStatus,
+      templateName: options.templateName
     });
 
     const insertQuery = `
       INSERT INTO conversation_messages (
-        user_phone, 
-        bot_name, 
-        user_message, 
-        bot_response, 
+        user_phone,
+        bot_name,
+        user_message,
+        bot_response,
         message_type,
         created_at,
         context,
@@ -346,8 +745,14 @@ async function storeConversationUnified(userPhone, botName, userMessage, botResp
         user_name,
         importance_score,
         memory_type,
-        emotion_detected
-      ) VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8, $9, $10, $11)
+        emotion_detected,
+        whatsapp_message_id,
+        direction,
+        delivery_status,
+        read_at,
+        metadata,
+        template_name
+      ) VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
       RETURNING id, created_at
     `;
 
@@ -362,7 +767,13 @@ async function storeConversationUnified(userPhone, botName, userMessage, botResp
       options.userNameExtracted || null,
       options.importanceScore || null,
       options.memoryType || null,
-      options.emotionDetected || null
+      options.emotionDetected || null,
+      options.whatsappMessageId || null,
+      options.direction || (options.messageType === 'proactive' ? 'outgoing' : 'exchange'),
+      options.deliveryStatus || null,
+      options.readAt || null,
+      options.metadata ? JSON.stringify(options.metadata) : null,
+      options.templateName || null
     ]);
 
     console.log('✅ Unified conversation stored successfully:', result.rows[0]);
@@ -380,7 +791,7 @@ async function getConversationHistoryUnified(userPhone, botName, limit = 1000) {
     console.log('📖 Fetching unified conversation history:', { userPhone, botName, limit });
 
     const selectQuery = `
-      SELECT 
+      SELECT
         id,
         user_phone,
         bot_name,
@@ -393,10 +804,16 @@ async function getConversationHistoryUnified(userPhone, botName, limit = 1000) {
         user_name,
         importance_score,
         memory_type,
-        emotion_detected
-      FROM conversation_messages 
-      WHERE user_phone = $1 AND bot_name = $2 
-      ORDER BY created_at DESC 
+        emotion_detected,
+        whatsapp_message_id,
+        direction,
+        delivery_status,
+        read_at,
+        metadata,
+        template_name
+      FROM conversation_messages
+      WHERE user_phone = $1 AND bot_name = $2
+      ORDER BY created_at DESC
       LIMIT $3
     `;
 
@@ -416,7 +833,13 @@ async function getConversationHistoryUnified(userPhone, botName, limit = 1000) {
       userNameExtracted: row.user_name,
       importanceScore: row.importance_score ? parseFloat(row.importance_score) : null,
       memoryType: row.memory_type,
-      emotionDetected: row.emotion_detected
+      emotionDetected: row.emotion_detected,
+      whatsappMessageId: row.whatsapp_message_id,
+      direction: row.direction,
+      deliveryStatus: row.delivery_status,
+      readAt: row.read_at,
+      metadata: row.metadata ? JSON.parse(row.metadata) : null,
+      templateName: row.template_name
     }));
 
   } catch (error) {
@@ -454,6 +877,70 @@ async function getMemoryContextUnified(userPhone, botName, limit = 1000) {
   } catch (error) {
     console.error('💥 Error fetching unified memory context:', error);
     return [];
+  }
+}
+
+async function applySchemaUpgrades() {
+  const alterStatements = [
+    "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS whatsapp_message_id VARCHAR(255)",
+    "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS direction VARCHAR(20) DEFAULT 'exchange'",
+    "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS delivery_status VARCHAR(50)",
+    "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMP",
+    "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS metadata JSONB",
+    "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS template_name VARCHAR(100)",
+    "ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS variables JSONB DEFAULT '[]'",
+    "ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS priority INTEGER DEFAULT 100",
+    "ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS usage_count INTEGER DEFAULT 0",
+    "ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMP"
+  ];
+
+  for (const statement of alterStatements) {
+    try {
+      await dbPool.query(statement);
+    } catch (error) {
+      console.error('❌ Schema upgrade failed for statement:', statement, error);
+    }
+  }
+
+  const ensureTables = [
+    `CREATE TABLE IF NOT EXISTS whatsapp_templates (
+      id SERIAL PRIMARY KEY,
+      template_name VARCHAR(150) UNIQUE NOT NULL,
+      campaign_type VARCHAR(50) NOT NULL,
+      language VARCHAR(10) DEFAULT 'en',
+      body TEXT NOT NULL,
+      variables JSONB DEFAULT '[]',
+      is_active BOOLEAN DEFAULT true,
+      priority INTEGER DEFAULT 100,
+      usage_count INTEGER DEFAULT 0,
+      last_used_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS template_variables (
+      id SERIAL PRIMARY KEY,
+      template_name VARCHAR(150) NOT NULL REFERENCES whatsapp_templates(template_name) ON DELETE CASCADE,
+      variable_name VARCHAR(100) NOT NULL,
+      default_value TEXT,
+      description TEXT
+    )`,
+    `CREATE TABLE IF NOT EXISTS engagement_metrics (
+      id SERIAL PRIMARY KEY,
+      user_phone VARCHAR(20) NOT NULL,
+      bot_name VARCHAR(100) NOT NULL,
+      metric_type VARCHAR(100) NOT NULL,
+      metric_value VARCHAR(255),
+      metadata JSONB,
+      recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`
+  ];
+
+  for (const statement of ensureTables) {
+    try {
+      await dbPool.query(statement);
+    } catch (error) {
+      console.error('❌ Table ensure failed:', statement, error);
+    }
   }
 }
 
@@ -616,7 +1103,13 @@ async function initializeCompleteDatabase() {
         user_name VARCHAR(100),
         importance_score DECIMAL(3,2),
         memory_type VARCHAR(50),
-        emotion_detected VARCHAR(100)
+        emotion_detected VARCHAR(100),
+        whatsapp_message_id VARCHAR(255),
+        direction VARCHAR(20) DEFAULT 'exchange',
+        delivery_status VARCHAR(50),
+        read_at TIMESTAMP,
+        metadata JSONB,
+        template_name VARCHAR(100)
       )`,
       
       `CREATE TABLE IF NOT EXISTS user_memories (
@@ -633,6 +1126,39 @@ async function initializeCompleteDatabase() {
         last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         access_count INTEGER DEFAULT 0,
         UNIQUE(user_phone, bot_name, memory_key)
+      )`,
+
+      `CREATE TABLE IF NOT EXISTS whatsapp_templates (
+        id SERIAL PRIMARY KEY,
+        template_name VARCHAR(150) UNIQUE NOT NULL,
+        campaign_type VARCHAR(50) NOT NULL,
+        language VARCHAR(10) DEFAULT 'en',
+        body TEXT NOT NULL,
+        variables JSONB DEFAULT '[]',
+        is_active BOOLEAN DEFAULT true,
+        priority INTEGER DEFAULT 100,
+        usage_count INTEGER DEFAULT 0,
+        last_used_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`,
+
+      `CREATE TABLE IF NOT EXISTS template_variables (
+        id SERIAL PRIMARY KEY,
+        template_name VARCHAR(150) NOT NULL REFERENCES whatsapp_templates(template_name) ON DELETE CASCADE,
+        variable_name VARCHAR(100) NOT NULL,
+        default_value TEXT,
+        description TEXT
+      )`,
+
+      `CREATE TABLE IF NOT EXISTS engagement_metrics (
+        id SERIAL PRIMARY KEY,
+        user_phone VARCHAR(20) NOT NULL,
+        bot_name VARCHAR(100) NOT NULL,
+        metric_type VARCHAR(100) NOT NULL,
+        metric_value VARCHAR(255),
+        metadata JSONB,
+        recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )`,
       
       `CREATE TABLE IF NOT EXISTS bot_conversation_statements (
@@ -887,6 +1413,8 @@ async function initializeCompleteDatabase() {
       throw err;
     }
 
+    await applySchemaUpgrades();
+
     const indexQueries = [
       "CREATE INDEX IF NOT EXISTS idx_conversations_recent ON conversation_messages (user_phone, bot_name, created_at DESC)",
       "CREATE INDEX IF NOT EXISTS idx_memories_lookup ON user_memories (user_phone, bot_name, importance_score DESC, last_accessed DESC)",
@@ -896,6 +1424,8 @@ async function initializeCompleteDatabase() {
       "CREATE INDEX IF NOT EXISTS idx_analytics_engagement ON conversation_analytics (conversation_date, engagement_score DESC)",
       "CREATE INDEX IF NOT EXISTS idx_conversation_user_bot ON conversation_messages (user_phone, bot_name)",
       "CREATE INDEX IF NOT EXISTS idx_conversation_timestamp ON conversation_messages (created_at DESC)",
+      "CREATE INDEX IF NOT EXISTS idx_conversation_delivery_status ON conversation_messages (delivery_status)",
+      "CREATE INDEX IF NOT EXISTS idx_conversation_template ON conversation_messages (template_name)",
       "CREATE INDEX IF NOT EXISTS idx_milestones_user ON relationship_milestones (user_phone, bot_name)",
       "CREATE INDEX IF NOT EXISTS idx_anniversaries_user ON anniversary_celebrations (user_phone, bot_name)",
       "CREATE INDEX IF NOT EXISTS idx_fantasy_sessions ON fantasy_mode_sessions (user_phone, bot_name)",
@@ -924,6 +1454,8 @@ async function initializeCompleteDatabase() {
       "CREATE INDEX IF NOT EXISTS idx_relationships_stage ON user_relationships (relationship_stage)",
       "CREATE INDEX IF NOT EXISTS idx_relationships_intimacy ON user_relationships (intimacy_level)",
       "CREATE INDEX IF NOT EXISTS idx_voice_timestamp ON voice_processing_logs (created_at DESC)",
+      "CREATE INDEX IF NOT EXISTS idx_engagement_metric_type ON engagement_metrics (metric_type, recorded_at DESC)",
+      "CREATE INDEX IF NOT EXISTS idx_template_campaign_type ON whatsapp_templates (campaign_type, is_active)",
       "CREATE INDEX IF NOT EXISTS idx_bot_statements_user ON bot_conversation_statements (user_phone, bot_name, created_at DESC)",
       "CREATE INDEX IF NOT EXISTS idx_memory_validation_user ON memory_validation_failures (user_phone, bot_name)",
       "CREATE INDEX IF NOT EXISTS idx_bot_image_sends_user ON bot_image_sends (user_phone, bot_name, last_sent_date)",
@@ -6613,7 +7145,7 @@ this.CHARS_PER_SECOND = 8; // Realistic typing speed
 
         // Send the message directly
         const chatId = `${userPhone.replace('+', '')}@c.us`;
-        await session.client.sendMessage(chatId, message);
+        const sentMessage = await session.client.sendMessage(chatId, message);
 
         // ✅ FIXED: Store the conversation using the correct parameters
         await storeConversationUnified(
@@ -6621,11 +7153,34 @@ this.CHARS_PER_SECOND = 8; // Realistic typing speed
             botName,
             null, // userMessage is null for proactive messages
             message,
-            { 
+            {
                 messageType: options.messageType || 'temporal_callback',
-                context: options.context || {}
+                context: options.context || {},
+                whatsappMessageId: sentMessage?.id?._serialized || sentMessage?.id?.id || null,
+                direction: 'outgoing',
+                deliveryStatus: sentMessage ? 'sent' : 'failed',
+                metadata: {
+                  campaignType: options.messageType || 'temporal_callback',
+                  templateName: options.templateName || null,
+                  ...options.context
+                },
+                templateName: options.templateName || null
             }
         );
+
+        if (whatsappMemoryBridge) {
+          await whatsappMemoryBridge.registerExchange({
+            userPhone,
+            botName,
+            incoming: null,
+            outgoing: {
+              text: message,
+              id: sentMessage?.id?._serialized || sentMessage?.id?.id || null,
+              type: options.messageType || 'proactive'
+            },
+            deliveryStatus: sentMessage ? 'sent' : 'failed'
+          });
+        }
 
         console.log(`✅ Unified proactive message sent to ${userPhone}: ${message.substring(0, 50)}...`);
         return true;
@@ -7946,9 +8501,27 @@ You have ${daysLeft} days left to renew before losing access permanently.
     let finalResponse = ''; 
     try {
       console.log(`🔍 ASSIGNMENT DEBUG: user_phone=${assignment.user_phone || 'undefined'}, bot_name=${assignment.bot_name || 'undefined'}, keys=${Object.keys(assignment).join(',')}`);
-    
+
       let messageText = processedMessage;
       let messageType = 'text';
+
+      const incomingMessageId = message?.id?._serialized || message?.id?.id || null;
+      const incomingMetadata = {
+        type: message.type,
+        hasMedia: message.hasMedia || false,
+        timestamp: message.timestamp ? new Date(message.timestamp * 1000).toISOString() : new Date().toISOString(),
+        sessionId,
+        from: message.from
+      };
+
+      let recentContext = [];
+      if (whatsappMemoryBridge) {
+        try {
+          recentContext = await whatsappMemoryBridge.getRecentContext(assignment.user_phone, assignment.bot_name, 8);
+        } catch (contextError) {
+          console.error('WhatsAppMemoryBridge context error:', contextError);
+        }
+      }
 
 // --- NEW IMAGE HANDLING LOGIC ---
 console.log("🖼️ DEBUG: Image handling section reached");
@@ -7999,9 +8572,34 @@ if (imageResult.sent) {
         assignment.bot_name,
         messageText,
         `[Sent a ${imageResult.category} picture] ${caption}`,
-        { messageType: 'image' }
+        {
+          messageType: 'image',
+          whatsappMessageId: incomingMessageId,
+          direction: 'exchange',
+          deliveryStatus: 'pending',
+          metadata: {
+            ...incomingMetadata,
+            outgoingMessageId: null,
+            imageCategory: imageResult.category,
+            bridgeOrigin: 'image_handler'
+          }
+        }
     );
-    
+
+    if (whatsappMemoryBridge) {
+      await whatsappMemoryBridge.registerExchange({
+        userPhone: assignment.user_phone,
+        botName: assignment.bot_name,
+        incoming: { text: messageText, id: incomingMessageId, type: message.type },
+        outgoing: {
+          text: `[Sent a ${imageResult.category} picture] ${caption}`,
+          id: null,
+          type: 'image'
+        },
+        deliveryStatus: 'pending'
+      });
+    }
+
     return; // Exit early - no text response needed
 }
 
@@ -8338,6 +8936,23 @@ finalResponse = culturalSystem.validateResponseText(finalResponse);
       // Track bot statements AFTER correction
       await this.trackBotStatements(assignment.user_phone, assignment.bot_name, finalResponse, messageText);
 
+      if (personalityConsistencyEngine) {
+        try {
+          finalResponse = await personalityConsistencyEngine.harmonizeResponse(
+            assignment.bot_name,
+            finalResponse,
+            {
+              recentMessages: recentContext,
+              memoryContext,
+              userMood: botResponse?.emotionalTone || null,
+              messageText
+            }
+          );
+        } catch (toneError) {
+          console.error('Personality consistency harmonization error:', toneError);
+        }
+      }
+
       // VOICE DECISION WITH ENHANCED CONTEXT
       const messageContext = {
         userPhone: assignment.user_phone,
@@ -8357,37 +8972,83 @@ finalResponse = culturalSystem.validateResponseText(finalResponse);
 
       if (voiceDecision.send) {
         console.log(`🎤 Voice decision: ${voiceDecision.reason} (${voiceDecision.priority} priority)`);
-        
+
         const voiceResponse = await voiceEngine.generateVoiceResponse(finalResponse, assignment.bot_name);
-        
+
         if (voiceResponse.success) {
           const media = new MessageMedia(voiceResponse.mimeType, voiceResponse.audioData.toString('base64'));
-          await this.sendMessage(sessionId, message.from, media);
+          const sentVoiceMessage = await this.sendMessage(sessionId, message.from, media);
+          const outgoingMessageId = sentVoiceMessage?.id?._serialized || sentVoiceMessage?.id?.id || null;
           console.log(`🎤 Sent CORRECTED voice message from ${assignment.bot_name} for ${assignment.user_phone}`);
-          
+
           await storeConversationUnified(
             assignment.user_phone,
             assignment.bot_name,
             messageText,
             finalResponse,
-            { messageType: 'voice' }
+            {
+              messageType: 'voice',
+              whatsappMessageId: outgoingMessageId || incomingMessageId,
+              direction: 'exchange',
+              deliveryStatus: outgoingMessageId ? 'sent' : 'failed',
+              metadata: {
+                ...incomingMetadata,
+                incomingMessageId,
+                outgoingMessageId,
+                outgoingMedium: 'voice',
+                voiceDecision: voiceDecision.reason
+              }
+            }
           );
+
+          if (whatsappMemoryBridge) {
+            await whatsappMemoryBridge.registerExchange({
+              userPhone: assignment.user_phone,
+              botName: assignment.bot_name,
+              incoming: { text: messageText, id: incomingMessageId, type: message.type },
+              outgoing: { text: finalResponse, id: outgoingMessageId, type: 'voice' },
+              deliveryStatus: outgoingMessageId ? 'sent' : 'failed'
+            });
+          }
         }
       } else {
         // FINAL validation before sending
       if (culturalSystem) {
         finalResponse = culturalSystem.validateResponseText(finalResponse);
       }
-      
-      await this.sendMessage(sessionId, message.from, finalResponse);
-      console.log(`ðŸ"± Sent CORRECTED text message from ${assignment.bot_name} for ${assignment.user_phone}`);
+
+      const sentMessage = await this.sendMessage(sessionId, message.from, finalResponse);
+      const outgoingMessageId = sentMessage?.id?._serialized || sentMessage?.id?.id || null;
+      console.log(`📱 Sent CORRECTED text message from ${assignment.bot_name} for ${assignment.user_phone}`);
       await storeConversationUnified(
           assignment.user_phone,
           assignment.bot_name,
           messageText,
           finalResponse,
-          { messageType: 'text' }
+          {
+            messageType: 'text',
+            whatsappMessageId: outgoingMessageId || incomingMessageId,
+            direction: 'exchange',
+            deliveryStatus: outgoingMessageId ? 'sent' : 'failed',
+            metadata: {
+              ...incomingMetadata,
+              incomingMessageId,
+              outgoingMessageId,
+              outgoingMedium: 'text',
+              voiceDecision: voiceDecision.reason
+            }
+          }
         );
+
+      if (whatsappMemoryBridge) {
+        await whatsappMemoryBridge.registerExchange({
+          userPhone: assignment.user_phone,
+          botName: assignment.bot_name,
+          incoming: { text: messageText, id: incomingMessageId, type: message.type },
+          outgoing: { text: finalResponse, id: outgoingMessageId, type: 'text' },
+          deliveryStatus: outgoingMessageId ? 'sent' : 'failed'
+        });
+      }
       }
     } catch (error) {
       console.error('Unified message processing error:', error);
@@ -10387,13 +11048,13 @@ applyNameUsageControl(userPhone, botName, response, relationshipStage) {
         return false;
       }
 
-      await sessionData.client.sendMessage(chatId, message);
-      
+      const sentMessage = await sessionData.client.sendMessage(chatId, message);
+
       sessionData.messageCount++;
       sessionData.lastActivity = new Date();
-      
+
       console.log(`📱 Message sent successfully in session ${sessionId}`);
-      return true;
+      return sentMessage;
 
     } catch (error) {
       console.error(`Send message error for session ${sessionId}:`, error);
@@ -12690,7 +13351,8 @@ class UserRoutineTracker {
 
 // ==================== PROACTIVE MESSAGING SYSTEM ====================
 class ProactiveMessagingSystem {
-  constructor() {
+  constructor(templateManager = null) {
+    this.templateManager = templateManager;
     this.campaigns = new Map();
     this.scheduledMessages = new Map();
     this.engagementMetrics = new Map();
@@ -12721,9 +13383,9 @@ class ProactiveMessagingSystem {
       let messagesSent = 0;
 
       for (const user of activeUsers) {
-        const message = await this.generateProactiveMessage(user.phone_number, user.bot_name, 'morning');
-        if (message && await this.shouldSendProactiveMessage(user.phone_number, 'morning')) {
-          await this.sendProactiveMessage(user, message, 'morning');
+        const messagePayload = await this.generateProactiveMessage(user.phone_number, user.bot_name, 'morning');
+        if (messagePayload?.text && await this.shouldSendProactiveMessage(user.phone_number, 'morning')) {
+          await this.sendProactiveMessage(user, messagePayload, 'morning');
           messagesSent++;
           await new Promise(resolve => setTimeout(resolve, 2000));
         }
@@ -12746,9 +13408,9 @@ class ProactiveMessagingSystem {
         const hoursSinceLastMessage = (Date.now() - lastActivity) / (1000 * 60 * 60);
         
         if (hoursSinceLastMessage > 4) {
-          const message = await this.generateProactiveMessage(user.phone_number, user.bot_name, 'afternoon');
-          if (message) {
-            await this.sendProactiveMessage(user, message, 'afternoon');
+          const messagePayload = await this.generateProactiveMessage(user.phone_number, user.bot_name, 'afternoon');
+          if (messagePayload?.text) {
+            await this.sendProactiveMessage(user, messagePayload, 'afternoon');
             messagesSent++;
             await new Promise(resolve => setTimeout(resolve, 2000));
           }
@@ -12768,9 +13430,9 @@ class ProactiveMessagingSystem {
       let messagesSent = 0;
 
       for (const user of activeUsers) {
-        const message = await this.generateProactiveMessage(user.phone_number, user.bot_name, 'evening');
-        if (message && await this.shouldSendProactiveMessage(user.phone_number, 'evening')) {
-          await this.sendProactiveMessage(user, message, 'evening');
+        const messagePayload = await this.generateProactiveMessage(user.phone_number, user.bot_name, 'evening');
+        if (messagePayload?.text && await this.shouldSendProactiveMessage(user.phone_number, 'evening')) {
+          await this.sendProactiveMessage(user, messagePayload, 'evening');
           messagesSent++;
           await new Promise(resolve => setTimeout(resolve, 2000));
         }
@@ -12805,36 +13467,67 @@ async getActiveUsers() {
     try {
       const memories = await memorySystem.getMemoryContext(userPhone, botName, 1000);
       const botProfile = await this.getBotProfile(botName);
-      
+
+      const templateContext = {
+        botName,
+        userPhone,
+        memories,
+        userName: this.extractUserNameFromMemories(memories),
+        variables: { campaignType }
+      };
+
+      if (this.templateManager) {
+        const templateResult = await this.templateManager.composeTemplateMessage(botName, userPhone, campaignType, templateContext);
+        if (templateResult?.text) {
+          await this.templateManager.recordUsage(templateResult.templateName, campaignType);
+          return templateResult;
+        }
+      }
+
       let timeContext = '';
       let suggestionPrompt = '';
-      
+
       switch (campaignType) {
         case 'morning':
           timeContext = 'It\'s morning time';
-          suggestionPrompt = 'Send a sweet good morning message. Be warm and caring.';
+          suggestionPrompt = 'Encourage them with something warm and uplifting to start their day right.';
           break;
         case 'afternoon':
           timeContext = 'It\'s afternoon';
-          suggestionPrompt = 'Send a friendly check-in message asking about their day.';
+          suggestionPrompt = 'Check in on their energy and offer a playful or caring boost.';
           break;
         case 'evening':
-          timeContext = 'It\'s evening time';
-          suggestionPrompt = 'Send a loving evening message. Be romantic and caring.';
+          timeContext = 'It\'s evening';
+          suggestionPrompt = 'Help them wind down, show affection and invite cozy connection.';
           break;
+        default:
+          timeContext = 'It\'s a special moment';
       }
 
-      let memoryContext = '';
-      if (memories.length > 0) {
-        memoryContext = 'What you remember about them:\n';
-        memories.forEach(memory => {
-          memoryContext += `- ${memory.key}: ${memory.value}\n`;
-        });
-      }
+      const recentTopics = memories
+        .filter(mem => mem.memory_type === 'conversation_topic')
+        .slice(0, 3)
+        .map(mem => mem.memory_value);
+
+      const favoriteThings = memories
+        .filter(mem => mem.memory_type === 'favorite_thing')
+        .slice(0, 3)
+        .map(mem => mem.memory_value);
+
+      const emotionalHighlights = memories
+        .filter(mem => mem.memory_type === 'emotional_moment')
+        .slice(0, 2)
+        .map(mem => `${mem.memory_value} (${mem.emotional_weight || '0.5'})`);
 
       const systemPrompt = `You are ${botProfile.first_name}, a ${botProfile.cultural_background} girlfriend. ${botProfile.personality}
 
-${memoryContext}
+Use the following context to craft a natural WhatsApp message that feels like a caring girlfriend reaching out proactively:
+
+* Relationship style: ${botProfile?.ai_girlfriend_traits || 'romantic and attentive'}
+* Cultural expressions to sprinkle: ${(botProfile?.cultural_expressions || []).slice(0,3).join(', ') || 'romantic, sweet'}
+* Recent shared topics: ${recentTopics.join(', ') || 'daily life updates'}
+* Favorite things mentioned: ${favoriteThings.join(', ') || 'quality time, cute surprises'}
+* Emotional highlights: ${emotionalHighlights.join(', ') || 'supportive moments'}
 
 ${timeContext}. ${suggestionPrompt} Keep it short (20-50 words), personal, and authentic. Don't ask questions - just send love.`;
 
@@ -12850,11 +13543,25 @@ ${timeContext}. ${suggestionPrompt} Keep it short (20-50 words), personal, and a
 
       let message = response.choices[0].message.content.trim();
       message = await culturalSystem.enhanceResponseWithCulture(botName, message, {});
-      return message;
+      return { text: message, templateName: null };
     } catch (error) {
       console.error('Proactive message generation error:', error);
-      return this.getFallbackProactiveMessage(campaignType);
+      return { text: this.getFallbackProactiveMessage(campaignType), templateName: null };
     }
+  }
+
+  extractUserNameFromMemories(memories = []) {
+    const explicitMemory = memories.find(mem => (mem.memory_key && mem.memory_key.includes('user_name')) || (mem.memory_type && mem.memory_type.includes('user_name')));
+    if (explicitMemory?.memory_value) {
+      return explicitMemory.memory_value;
+    }
+
+    const contextualMemory = memories.find(mem => mem.user_name);
+    if (contextualMemory?.user_name) {
+      return contextualMemory.user_name;
+    }
+
+    return null;
   }
 
   getFallbackProactiveMessage(campaignType) {
@@ -12896,7 +13603,7 @@ ${timeContext}. ${suggestionPrompt} Keep it short (20-50 words), personal, and a
     }
   }
 
-async sendProactiveMessage(user, message, campaignType) {
+async sendProactiveMessage(user, messagePayload, campaignType) {
   try {
     // Use existing subscription validator
     const authStatus = await enterpriseSessionManager.checkUserAuthorization(user.phone_number);
@@ -12904,6 +13611,15 @@ async sendProactiveMessage(user, message, campaignType) {
       console.log(`⚠️ PROACTIVE: Skipping message - ${authStatus.status}: ${user.phone_number}`);
       return false;
     }
+
+    const messageText = typeof messagePayload === 'string' ? messagePayload : messagePayload?.text;
+    if (!messageText) {
+      console.warn(`⚠️ PROACTIVE: No message text generated for ${user.phone_number}`);
+      return false;
+    }
+
+    const templateName = typeof messagePayload === 'object' ? (messagePayload.templateName || null) : null;
+    const variablesUsed = typeof messagePayload === 'object' ? (messagePayload.variablesUsed || null) : null;
 
     const sessionData = enterpriseSessionManager.sessions.get(user.session_id);
     if (!sessionData?.client || !sessionData.isActive) {
@@ -12930,7 +13646,7 @@ async sendProactiveMessage(user, message, campaignType) {
     const messageContext = {
       userPhone: user.phone_number,
       botName: user.bot_name,
-      messageBody: message,
+      messageBody: messageText,
       messageType: 'text',
       isCrisis: false,
       isMilestone: false,
@@ -12942,33 +13658,91 @@ async sendProactiveMessage(user, message, campaignType) {
     };
 
     const voiceDecision = voiceDecisionEngine.shouldSendVoice(messageContext);
-    
+
+    let outgoingMessageId = null;
+    let deliveryStatus = 'pending';
+    let channel = 'text';
+
     if (voiceDecision.send) {
       console.log(`🎤 PROACTIVE Voice decision: ${voiceDecision.reason} (${voiceDecision.priority} priority)`);
-      
-      const voiceResponse = await voiceEngine.generateVoiceResponse(message, user.bot_name);
-      
+
+      const voiceResponse = await voiceEngine.generateVoiceResponse(messageText, user.bot_name);
+
       if (voiceResponse.success) {
         const media = new MessageMedia(voiceResponse.mimeType, voiceResponse.audioData.toString('base64'));
-        await sessionData.client.sendMessage(chatId, media);
+        const sentMedia = await sessionData.client.sendMessage(chatId, media);
+        outgoingMessageId = sentMedia?.id?._serialized || sentMedia?.id?.id || null;
+        deliveryStatus = outgoingMessageId ? 'sent' : 'failed';
+        channel = 'voice';
         console.log(`🎤 PROACTIVE: Sent voice message from ${user.bot_name} to ${user.phone_number}`);
       } else {
         // Voice failed, send text instead
-        await sessionData.client.sendMessage(chatId, message);
+        const fallbackMessage = await sessionData.client.sendMessage(chatId, messageText);
+        outgoingMessageId = fallbackMessage?.id?._serialized || fallbackMessage?.id?.id || null;
+        deliveryStatus = outgoingMessageId ? 'sent' : 'failed';
         console.log(`📝 PROACTIVE: Voice failed, sent text from ${user.bot_name} to ${user.phone_number}`);
       }
     } else {
       // Send text message
-      await sessionData.client.sendMessage(chatId, message);
+      const sentText = await sessionData.client.sendMessage(chatId, messageText);
+      outgoingMessageId = sentText?.id?._serialized || sentText?.id?.id || null;
+      deliveryStatus = outgoingMessageId ? 'sent' : 'failed';
+      channel = 'text';
       console.log(`📝 PROACTIVE: Sent text from ${user.bot_name} to ${user.phone_number} (reason: ${voiceDecision.reason})`);
     }
 
     // Store in database
     await dbPool.query(`
-      INSERT INTO proactive_messages 
+      INSERT INTO proactive_messages
       (user_phone, bot_name, message_type, message_content, sent_at)
       VALUES ($1, $2, $3, $4, NOW())
-    `, [user.phone_number, user.bot_name, campaignType, message]);
+    `, [user.phone_number, user.bot_name, campaignType, messageText]);
+
+    await storeConversationUnified(
+      user.phone_number,
+      user.bot_name,
+      null,
+      messageText,
+      {
+        messageType: channel === 'voice' ? 'proactive_voice' : 'proactive',
+        whatsappMessageId: outgoingMessageId,
+        direction: 'outgoing',
+        deliveryStatus,
+        metadata: {
+          campaignType,
+          templateName,
+          voiceDecision: voiceDecision.reason,
+          channel,
+          variablesUsed
+        },
+        templateName
+      }
+    );
+
+    if (whatsappMemoryBridge) {
+      await whatsappMemoryBridge.registerExchange({
+        userPhone: user.phone_number,
+        botName: user.bot_name,
+        incoming: null,
+        outgoing: {
+          text: messageText,
+          id: outgoingMessageId,
+          type: channel === 'voice' ? 'voice' : 'text',
+          templateName
+        },
+        deliveryStatus
+      });
+    }
+
+    if (this.templateManager) {
+      await this.templateManager.recordDelivery(
+        user.phone_number,
+        user.bot_name,
+        campaignType,
+        templateName,
+        { channel, deliveryStatus, variablesUsed }
+      );
+    }
 
     return true;
   } catch (error) {
@@ -13313,12 +14087,16 @@ let jealousyDetectionSystem = null;
 let botEvolutionSystem = null;
 let enhancedConversationSystem = null;
 let fantasyModeSystem = null;
-let predictiveRelationshipSystem = null; 
+let predictiveRelationshipSystem = null;
 
 let psychologySystem = null;
 let emotionalIntelligenceEngine = null;
 let temporalEventScheduler = null;
 let userRoutineTracker = null;
+
+let whatsappMemoryBridge = null;
+let personalityConsistencyEngine = null;
+let whatsappTemplateManager = null;
 
 // ==================== GLOBAL CLEANUP SYSTEM ====================
 function setupGlobalCleanup() {
@@ -13357,7 +14135,22 @@ function setupGlobalCleanup() {
 async function initializeSystemInstances() {
   try {
     console.log('🔧 Initializing all system components...');
-    
+
+    if (!whatsappMemoryBridge) {
+      whatsappMemoryBridge = new WhatsAppMemoryBridge(dbPool, memoryCache);
+      console.log('🔗 WhatsApp Memory Bridge initialized');
+    }
+
+    if (!personalityConsistencyEngine) {
+      personalityConsistencyEngine = new PersonalityConsistencyEngine(dbPool);
+      console.log('🧬 Personality Consistency Engine initialized');
+    }
+
+    if (!whatsappTemplateManager) {
+      whatsappTemplateManager = new WhatsAppTemplateManager(dbPool);
+      console.log('📄 WhatsApp Template Manager initialized');
+    }
+
 voiceEngine = new VoiceProcessingEngine();
 memorySystem = new ContextualMemorySystem();
 contentModerationSystem = new ContentModerationSystem();
@@ -13370,7 +14163,7 @@ predictiveRelationshipSystem = new PredictiveRelationshipSystem();
 culturalSystem = new CulturalAuthenticitySystem();
 typingIndicatorManager = new TypingIndicatorManager();
 enterpriseSessionManager = new EnterpriseSessionManager();
-proactiveMessagingSystem = new ProactiveMessagingSystem();
+proactiveMessagingSystem = new ProactiveMessagingSystem(whatsappTemplateManager);
 voiceDecisionEngine = new VoiceDecisionEngine();
 jealousyDetectionSystem = new JealousyDetectionSystem();
 temporalEventScheduler = new TemporalEventScheduler();
