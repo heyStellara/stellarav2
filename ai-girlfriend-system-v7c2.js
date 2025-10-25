@@ -1488,10 +1488,30 @@ async function initializeCompleteDatabase() {
     }
 
     // Create views
-    const viewQueries = [
-      `CREATE OR REPLACE VIEW active_user_relationships AS
+    // Recreate views with explicit column ordering to avoid replacement conflicts
+    const dropViewQuery = 'DROP VIEW IF EXISTS active_user_relationships';
+    await dbPool.query(dropViewQuery);
+    console.log('🗑️ Dropped view: active_user_relationships');
+
+    const createViewQuery = `CREATE VIEW active_user_relationships AS
         SELECT
-          ur.*,
+          ur.id,
+          ur.user_phone,
+          ur.bot_name,
+          ur.relationship_stage,
+          ur.intimacy_level,
+          ur.affection_points,
+          ur.trust_level,
+          ur.compatibility_score,
+          ur.total_interactions,
+          ur.negative_interaction_score,
+          ur.positive_interaction_score,
+          ur.last_negative_decay,
+          ur.last_positive_decay,
+          ur.relationship_status,
+          ur.milestone_reached,
+          ur.last_interaction,
+          ur.created_at,
           sa.session_id,
           au.payment_verified,
           au.subscription_expires_at,
@@ -1501,13 +1521,10 @@ async function initializeCompleteDatabase() {
         JOIN session_assignments sa ON ur.user_phone = sa.user_phone AND ur.bot_name = sa.bot_name
         JOIN authorized_users au ON ur.user_phone = au.user_phone
         JOIN bots b ON ur.bot_name = b.bot_name
-        WHERE sa.is_active = true AND au.subscription_expires_at > NOW()`
-    ];
+        WHERE sa.is_active = true AND au.subscription_expires_at > NOW()`;
 
-    for (const query of viewQueries) {
-      await dbPool.query(query);
-      console.log(`✅ Created view: ${query.substring(0, 80)}...`);
-    }
+    await dbPool.query(createViewQuery);
+    console.log('✅ Created view: active_user_relationships');
 
     console.log("✅ Database schema initialized successfully");
   } catch (error) {
