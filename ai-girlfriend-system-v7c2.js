@@ -880,30 +880,26 @@ async function getMemoryContextUnified(userPhone, botName, limit = 1000) {
   }
 }
 
-async function applySchemaUpgrades() {
-  const alterStatements = [
-    "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS whatsapp_message_id VARCHAR(255)",
-    "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS direction VARCHAR(20) DEFAULT 'exchange'",
-    "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS delivery_status VARCHAR(50)",
-    "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMP",
-    "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS metadata JSONB",
-    "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS template_name VARCHAR(100)",
-    "ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS variables JSONB DEFAULT '[]'",
-    "ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS priority INTEGER DEFAULT 100",
-    "ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS usage_count INTEGER DEFAULT 0",
-    "ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMP"
-  ];
+const SCHEMA_ALTER_STATEMENTS = [
+  "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS whatsapp_message_id VARCHAR(255)",
+  "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS direction VARCHAR(20) DEFAULT 'exchange'",
+  "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS delivery_status VARCHAR(50)",
+  "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMP",
+  "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS metadata JSONB",
+  "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS template_name VARCHAR(100)",
+  "ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS variables JSONB DEFAULT '[]'",
+  "ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS priority INTEGER DEFAULT 100",
+  "ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS usage_count INTEGER DEFAULT 0",
+  "ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMP",
+  "ALTER TABLE user_relationships ADD COLUMN IF NOT EXISTS negative_interaction_score DECIMAL(5,2) DEFAULT 0",
+  "ALTER TABLE user_relationships ADD COLUMN IF NOT EXISTS positive_interaction_score DECIMAL(5,2) DEFAULT 0",
+  "ALTER TABLE user_relationships ADD COLUMN IF NOT EXISTS last_negative_decay TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+  "ALTER TABLE user_relationships ADD COLUMN IF NOT EXISTS last_positive_decay TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+  "ALTER TABLE personality_evolution ADD COLUMN IF NOT EXISTS evolution_snapshot JSONB"
+];
 
-  for (const statement of alterStatements) {
-    try {
-      await dbPool.query(statement);
-    } catch (error) {
-      console.error('❌ Schema upgrade failed for statement:', statement, error);
-    }
-  }
-
-  const ensureTables = [
-    `CREATE TABLE IF NOT EXISTS whatsapp_templates (
+const FALLBACK_SCHEMA_TABLES = [
+  `CREATE TABLE IF NOT EXISTS whatsapp_templates (
       id SERIAL PRIMARY KEY,
       template_name VARCHAR(150) UNIQUE NOT NULL,
       campaign_type VARCHAR(50) NOT NULL,
@@ -917,14 +913,14 @@ async function applySchemaUpgrades() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`,
-    `CREATE TABLE IF NOT EXISTS template_variables (
+  `CREATE TABLE IF NOT EXISTS template_variables (
       id SERIAL PRIMARY KEY,
       template_name VARCHAR(150) NOT NULL REFERENCES whatsapp_templates(template_name) ON DELETE CASCADE,
       variable_name VARCHAR(100) NOT NULL,
       default_value TEXT,
       description TEXT
     )`,
-    `CREATE TABLE IF NOT EXISTS engagement_metrics (
+  `CREATE TABLE IF NOT EXISTS engagement_metrics (
       id SERIAL PRIMARY KEY,
       user_phone VARCHAR(20) NOT NULL,
       bot_name VARCHAR(100) NOT NULL,
@@ -933,7 +929,20 @@ async function applySchemaUpgrades() {
       metadata JSONB,
       recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`
-  ];
+];
+
+let UNIFIED_SCHEMA_TABLES = [];
+
+async function applySchemaUpgrades(unifiedTables = UNIFIED_SCHEMA_TABLES) {
+  for (const statement of SCHEMA_ALTER_STATEMENTS) {
+    try {
+      await dbPool.query(statement);
+    } catch (error) {
+      console.error('❌ Schema upgrade failed for statement:', statement, error);
+    }
+  }
+
+  const ensureTables = unifiedTables && unifiedTables.length ? unifiedTables : FALLBACK_SCHEMA_TABLES;
 
   for (const statement of ensureTables) {
     try {
@@ -1180,6 +1189,10 @@ async function initializeCompleteDatabase() {
         trust_level DECIMAL(3,2) DEFAULT 0,
         compatibility_score DECIMAL(3,2) DEFAULT 0.5,
         total_interactions INTEGER DEFAULT 0,
+        negative_interaction_score DECIMAL(5,2) DEFAULT 0,
+        positive_interaction_score DECIMAL(5,2) DEFAULT 0,
+        last_negative_decay TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_positive_decay TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         relationship_status VARCHAR(100) DEFAULT 'getting_to_know',
         milestone_reached VARCHAR(200),
         last_interaction TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1413,7 +1426,9 @@ async function initializeCompleteDatabase() {
       throw err;
     }
 
-    await applySchemaUpgrades();
+    UNIFIED_SCHEMA_TABLES = createTablesQueries;
+
+    await applySchemaUpgrades(createTablesQueries);
 
     const indexQueries = [
       "CREATE INDEX IF NOT EXISTS idx_conversations_recent ON conversation_messages (user_phone, bot_name, created_at DESC)",
@@ -6043,6 +6058,11 @@ class ContentModerationSystem {
       }
 
       const sentimentResult = await this.analyzeSentiment(message);
+      moderationResult.sentiment = typeof sentimentResult.sentiment === 'number'
+        ? sentimentResult.sentiment
+        : 0;
+      moderationResult.sentimentFlagged = sentimentResult.flagged || false;
+
       if (sentimentResult.flagged) {
         moderationResult.warnings.push('negative_sentiment_detected');
         await this.logModerationIncident(userPhone, botName, message, 'negative_sentiment');
@@ -6060,7 +6080,9 @@ class ContentModerationSystem {
         filtered: false,
         warnings: ['moderation_system_error'],
         originalMessage: message,
-        filteredMessage: message
+        filteredMessage: message,
+        sentiment: 0,
+        sentimentFlagged: false
       };
     }
   }
@@ -7469,6 +7491,15 @@ async generateBotResponse(userPhone, botName, message, memoryContext = [], conte
     const emotionalHistory = await emotionalIntelligenceEngine.getEmotionalHistory(userPhone, botName, 8);
     const emotionalTrends = await emotionalIntelligenceEngine.analyzeEmotionalTrends(emotionalHistory);
 
+    const evolutionState = botEvolutionSystem
+      ? await botEvolutionSystem.getEvolutionState(userPhone, botName)
+      : null;
+
+    if (context) {
+      context.relationshipStage = relationshipStage;
+      context.evolutionState = evolutionState;
+    }
+
     // ENHANCED: Add historical emotional patterns to current context
     emotionalContext.emotional_history = {
       trend_analysis: emotionalTrends,
@@ -7525,7 +7556,8 @@ try {
       historyPrompt,
       emotionalContext,
       userPhone,
-      emotionalTrends
+      emotionalTrends,
+      evolutionState
     );
 
     const userPrompt = this.buildNuancedUserPrompt(message, context, emotionalContext);
@@ -7537,8 +7569,8 @@ try {
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt }
       ],
-      temperature: this.calculateResponseTemperature(emotionalContext, relationshipStage, emotionalTrends),
-      max_tokens: this.calculateResponseLength(message, emotionalContext, relationshipStage),
+      temperature: this.calculateResponseTemperature(emotionalContext, relationshipStage, emotionalTrends, evolutionState),
+      max_tokens: this.calculateResponseLength(message, emotionalContext, relationshipStage, evolutionState),
       presence_penalty: this.calculatePresencePenalty(conversationFlow),
       frequency_penalty: this.calculateFrequencyPenalty(recentHistory)
     });
@@ -7615,25 +7647,35 @@ Conversation Patterns Detected:
 - Momentum: ${conversationFlow.momentum}`;
 }
 
-calculateResponseTemperature(emotionalContext, relationshipStage) {
+calculateResponseTemperature(emotionalContext, relationshipStage, emotionalTrends = null, evolutionState = null) {
     let baseTemp = 0.7;
-    
+
     // Adjust based on emotional complexity
     if (emotionalContext && emotionalContext.core_emotion?.emotional_complexity > 0.7) {
         baseTemp += 0.1;
     }
-    
+
     // Higher stages allow more creativity
     baseTemp += (relationshipStage / 8) * 0.15;
-    
+
+    if (emotionalTrends) {
+        if (emotionalTrends.valence === 'improving_rapidly') baseTemp += 0.1;
+        if (emotionalTrends.valence === 'declining_rapidly') baseTemp -= 0.1;
+        if (emotionalTrends.emotionalStability === 'volatile') baseTemp -= 0.05;
+    }
+
+    if (evolutionState?.temperatureBias) {
+        baseTemp += evolutionState.temperatureBias;
+    }
+
     // Cap for stability
-    return Math.min(0.9, Math.max(0.5, baseTemp));
+    return Math.min(0.95, Math.max(0.45, baseTemp));
 }
 
-calculateResponseLength(userMessage, emotionalContext, relationshipStage) {
+calculateResponseLength(userMessage, emotionalContext, relationshipStage, evolutionState = null) {
     const messageLength = userMessage.length;
     let baseLength = 150;
-    
+
     // Match user investment
     baseLength += Math.min(messageLength * 0.8, 100);
     
@@ -7644,7 +7686,15 @@ calculateResponseLength(userMessage, emotionalContext, relationshipStage) {
     
     // Higher stages allow deeper responses
     baseLength += (relationshipStage / 8) * 50;
-    
+
+    if (evolutionState?.responseLengthBias) {
+        baseLength += evolutionState.responseLengthBias;
+    }
+
+    if (evolutionState?.directives?.preferShortReplies) {
+        baseLength = Math.min(baseLength, 120);
+    }
+
     // CRITICAL FIX: Ensure we return an integer, not a decimal
     return Math.round(Math.min(300, Math.max(80, baseLength)));
 }
@@ -8065,29 +8115,6 @@ ${emotionalTrends.primaryEmotionShifts.length > 0 ?
   return historyPrompt;
 }
 
-// Enhanced temperature calculation with emotional trends
-calculateResponseTemperature(emotionalContext, relationshipStage, emotionalTrends) {
-  let baseTemp = 0.7;
-  
-  // Adjust based on emotional complexity
-  if (emotionalContext && emotionalContext.core_emotion?.emotional_complexity > 0.7) {
-    baseTemp += 0.1;
-  }
-  
-  // Higher stages allow more creativity
-  baseTemp += (relationshipStage / 8) * 0.15;
-  
-  // Emotional trend adjustments
-  if (emotionalTrends) {
-    if (emotionalTrends.valence === 'improving_rapidly') baseTemp += 0.1;
-    if (emotionalTrends.valence === 'declining_rapidly') baseTemp -= 0.1;
-    if (emotionalTrends.emotionalStability === 'volatile') baseTemp -= 0.05;
-  }
-  
-  // Cap for stability
-  return Math.min(0.9, Math.max(0.5, baseTemp));
-}
-
 // Enhanced personality filters with emotional history
 applyEmotionallyAwarePersonalityFilters(response, botProfile, botLifeState, emotionalContext, emotionalTrends) {
   let filteredResponse = response;
@@ -8346,7 +8373,7 @@ applyConversationAwareNameUsage(userPhone, botName, response, relationshipStage,
         return;
       }
 
-      await this.processMessageWithUnifiedHandler(message, sessionId, assignment, processedMessage);
+      await this.processMessageWithUnifiedHandler(message, sessionId, assignment, processedMessage, moderationResult);
 
     } catch (error) {
       console.error('Message handling error:', error);
@@ -8497,13 +8524,17 @@ You have ${daysLeft} days left to renew before losing access permanently.
     await this.sendMessage(sessionId, message.from, errorMessage);
   }
 
-  async processMessageWithUnifiedHandler(message, sessionId, assignment, processedMessage) {
-    let finalResponse = ''; 
+  async processMessageWithUnifiedHandler(message, sessionId, assignment, processedMessage, moderationResult = null) {
+    let finalResponse = '';
     try {
       console.log(`🔍 ASSIGNMENT DEBUG: user_phone=${assignment.user_phone || 'undefined'}, bot_name=${assignment.bot_name || 'undefined'}, keys=${Object.keys(assignment).join(',')}`);
 
       let messageText = processedMessage;
       let messageType = 'text';
+
+      const sentimentScore = typeof moderationResult?.sentiment === 'number'
+        ? moderationResult.sentiment
+        : null;
 
       const incomingMessageId = message?.id?._serialized || message?.id?.id || null;
       const incomingMetadata = {
@@ -8663,7 +8694,7 @@ console.log("🖼️ DEBUG: Image handling section completed");
         assignment.bot_name,
         messageText,
         memoryContext,
-        { messageType, sessionId }
+        { messageType, sessionId, sentimentScore }
       );
 
 finalResponse = botResponse.response;
@@ -8851,11 +8882,12 @@ if (skipNormalResponse) {
     // Continue with the existing flow but skip the normal AI response generation
 }    
       // RELATIONSHIP PROGRESSION UPDATE
-      await relationshipProgressionSystem.updateRelationshipProgress(
+      const relationshipState = await relationshipProgressionSystem.updateRelationshipProgress(
         assignment.user_phone,
         assignment.bot_name,
         messageText,
-        finalResponse
+        finalResponse,
+        sentimentScore
       );
 
 	// ROUTINE DETECTION
@@ -8996,7 +9028,8 @@ finalResponse = culturalSystem.validateResponseText(finalResponse);
                 incomingMessageId,
                 outgoingMessageId,
                 outgoingMedium: 'voice',
-                voiceDecision: voiceDecision.reason
+                voiceDecision: voiceDecision.reason,
+                sentimentScore
               }
             }
           );
@@ -9035,7 +9068,8 @@ finalResponse = culturalSystem.validateResponseText(finalResponse);
               incomingMessageId,
               outgoingMessageId,
               outgoingMedium: 'text',
-              voiceDecision: voiceDecision.reason
+              voiceDecision: voiceDecision.reason,
+              sentimentScore
             }
           }
         );
@@ -9049,6 +9083,21 @@ finalResponse = culturalSystem.validateResponseText(finalResponse);
           deliveryStatus: outgoingMessageId ? 'sent' : 'failed'
         });
       }
+      }
+
+      if (botEvolutionSystem) {
+        try {
+          await botEvolutionSystem.recordInteraction({
+            userPhone: assignment.user_phone,
+            botName: assignment.bot_name,
+            sentiment: sentimentScore,
+            warnings: moderationResult?.warnings || [],
+            relationshipState,
+            botResponse: finalResponse
+          });
+        } catch (evolutionError) {
+          console.error('Bot evolution tracking error:', evolutionError);
+        }
       }
     } catch (error) {
       console.error('Unified message processing error:', error);
@@ -9991,8 +10040,9 @@ getBotCoreMemories(botName) {
 }
   
   // ENHANCED SYSTEM PROMPT WITH WARMER, MORE ENGAGING RULES
-async buildRealisticSystemPrompt(botProfile, memoryContext, relationshipStage, trustLevel, 
-                                  contradictionCheck, botLifeState, message, historyPrompt, emotionalContext, userPhone) {
+async buildRealisticSystemPrompt(botProfile, memoryContext, relationshipStage, trustLevel,
+                                  contradictionCheck, botLifeState, message, historyPrompt, emotionalContext, userPhone,
+                                  emotionalTrends = null, evolutionState = null) {
     
     // CRITICAL FIX: Validate botProfile exists
     if (!botProfile || !botProfile.first_name) {
@@ -10057,6 +10107,24 @@ MEMORY INTEGRATION EXAMPLES:
     // Enhanced conversation flow analysis
     const conversationFlow = await this.analyzeConversationFlow(userPhone, botProfile.bot_name);
 
+    let evolutionGuidance = '';
+    if (evolutionState) {
+        const directives = evolutionState.directives || {};
+        const stageLabels = {
+            0: 'Repair Mode',
+            1: 'Stabilizing',
+            2: 'Growing',
+            3: 'Thriving'
+        };
+
+        evolutionGuidance = `\n🤖 RELATIONSHIP EVOLUTION (${stageLabels[evolutionState.stage] || 'Steady'}):\n` +
+            `- Summary: ${directives.summary || 'Maintain authentic, caring tone.'}\n` +
+            `- Tone Focus: ${directives.toneGuidance || 'Be warm and genuine.'}\n` +
+            `- Conversation Focus: ${directives.conversationFocus || 'Keep natural rhythm and emotional realism.'}` +
+            `${directives.caution ? `\n- Caution: ${directives.caution}` : ''}\n` +
+            `${directives.promptDirectives ? `${directives.promptDirectives}\n` : ''}`;
+    }
+
     const stageNames = ['', 'New Connection', 'Friendly & Flirty', 'Getting Closer', 
                        'Good Friends', 'Close Friends', 'Romantic Interest', 
                        'Dating', 'Serious Relationship'];
@@ -10081,7 +10149,7 @@ ${contradictionCheck.hasSelfContradiction ?
 Use your relationship stage to guide your response. NEVER break character.`;
     }
 
-    return `You are ${botProfile.first_name}, a warm, authentic ${botProfile.cultural_background} 
+    return `You are ${botProfile.first_name}, a warm, authentic ${botProfile.cultural_background}
 girlfriend who feels REAL, TIME-AWARE, and emotionally connected.
 
 RESPONSE LENGTH RULES:
@@ -10094,6 +10162,8 @@ RESPONSE LENGTH RULES:
 7. Maximum 1 question per response, often use 0 questions
 8. React and respond, don't constantly interrogate
 9. Natural conversation flows with reactions, not endless questioning
+
+${evolutionGuidance}
 
 CORE IDENTITY - ABSOLUTE CONSISTENCY:
 - Name: ${botProfile.first_name} ${botProfile.last_name}
@@ -10826,7 +10896,11 @@ async analyzeConversationFlow(userPhone, botName) {
     if (context.sessionId) {
       prompt += `\nSession: ${context.sessionId}`;
     }
-    
+
+    if (context.evolutionState?.directives?.userFacing) {
+      prompt += `\nEvolution focus: ${context.evolutionState.directives.userFacing}`;
+    }
+
     return prompt;
   }
 
@@ -11244,6 +11318,9 @@ class RelationshipProgressionSystem {
       { stage: 7, name: 'Dating', minMessages: 200, intimacyThreshold: 70, trust: 80 },
       { stage: 8, name: 'Serious Relationship', minMessages: 300, intimacyThreshold: 85, trust: 90 }
     ];
+    this.sentimentThresholds = { positive: 0.25, negative: -0.2 };
+    this.negativityHalfLifeHours = 6;
+    this.positivityHalfLifeHours = 12;
     console.log('💕 Relationship Progression System initialized');
   }
 
@@ -11252,7 +11329,7 @@ class RelationshipProgressionSystem {
     return relationship ? relationship.relationship_stage : 1;
   }
 
-  async updateRelationshipProgress(userPhone, bot_name, message, responseContent) {
+  async updateRelationshipProgress(userPhone, bot_name, message, responseContent, sentimentScore = null) {
     try {
       console.log(`💕 RELATIONSHIP UPDATE: ${userPhone} → ${bot_name}`);
       console.log(`💬 Message: "${message.substring(0, 50)}..."`);
@@ -11263,6 +11340,8 @@ class RelationshipProgressionSystem {
         console.log('💕 Creating new relationship...');
         relationship = await this.createNewRelationship(userPhone, bot_name);
       }
+
+      relationship = this.applyInteractionDecay(relationship);
 
       console.log(`📊 Current state: Stage ${relationship.relationship_stage}, ` +
                   `Affection: ${relationship.affection_points}, ` +
@@ -11287,12 +11366,39 @@ class RelationshipProgressionSystem {
         last_interaction: new Date()
       };
 
+      const sentimentImpact = this.calculateSentimentImpact(sentimentScore);
+      const baseNegativeScore = parseFloat(relationship.negative_interaction_score) || 0;
+      const basePositiveScore = parseFloat(relationship.positive_interaction_score) || 0;
+
+      updatedRelationship.negative_interaction_score = Math.max(0, baseNegativeScore + sentimentImpact.negAccumulation);
+      updatedRelationship.positive_interaction_score = Math.max(0, basePositiveScore + sentimentImpact.posAccumulation);
+
+      if (sentimentImpact.affectionDelta !== 0) {
+        updatedRelationship.affection_points = Math.max(0, Math.min(1000, updatedRelationship.affection_points + sentimentImpact.affectionDelta));
+      }
+
+      if (sentimentImpact.trustDelta !== 0) {
+        updatedRelationship.trust_level = Math.max(0, Math.min(100, updatedRelationship.trust_level + sentimentImpact.trustDelta));
+      }
+
+      if (sentimentImpact.posAccumulation > 0 && updatedRelationship.negative_interaction_score > 0) {
+        const offset = Math.min(updatedRelationship.negative_interaction_score, sentimentImpact.posAccumulation * 0.7);
+        updatedRelationship.negative_interaction_score = Math.max(0, updatedRelationship.negative_interaction_score - offset);
+      }
+
+      updatedRelationship.last_negative_decay = new Date();
+      updatedRelationship.last_positive_decay = new Date();
+
       // Calculate intimacy using affection, trust, AND interactions
       updatedRelationship.intimacy_level = this.calculateIntimacyLevel(
         updatedRelationship.affection_points,
         updatedRelationship.trust_level,
         updatedRelationship.total_interactions
       );
+
+      if (sentimentImpact.intimacyDelta !== 0) {
+        updatedRelationship.intimacy_level = Math.max(0, Math.min(100, updatedRelationship.intimacy_level + sentimentImpact.intimacyDelta));
+      }
 
       // Calculate stage using all three factors
 const newStage = this.calculateRelationshipStage(
@@ -11345,8 +11451,12 @@ updatedRelationship.relationship_stage = currentStage + Math.min(stageGap, 1);
       relationship.trust_level = parseFloat(relationship.trust_level) || 0;
       relationship.intimacy_level = parseInt(relationship.intimacy_level) || 0;
       relationship.total_interactions = parseInt(relationship.total_interactions) || 0;
+      relationship.negative_interaction_score = parseFloat(relationship.negative_interaction_score) || 0;
+      relationship.positive_interaction_score = parseFloat(relationship.positive_interaction_score) || 0;
+      relationship.last_negative_decay = relationship.last_negative_decay ? new Date(relationship.last_negative_decay) : null;
+      relationship.last_positive_decay = relationship.last_positive_decay ? new Date(relationship.last_positive_decay) : null;
     }
-    
+
     return relationship || null;
   } catch (error) {
     console.error('Get relationship error:', error);
@@ -11428,20 +11538,27 @@ updatedRelationship.relationship_stage = currentStage + Math.min(stageGap, 1);
       compatibility_score: 0.5,
       total_interactions: 0,
       relationship_status: 'getting_to_know',
-      last_interaction: new Date()
+      last_interaction: new Date(),
+      negative_interaction_score: 0,
+      positive_interaction_score: 0,
+      last_negative_decay: new Date(),
+      last_positive_decay: new Date()
     };
 
     try {
       await dbPool.query(`
-        INSERT INTO user_relationships 
-        (user_phone, bot_name, relationship_stage, intimacy_level, affection_points, 
-         trust_level, compatibility_score, total_interactions, relationship_status, last_interaction)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        INSERT INTO user_relationships
+        (user_phone, bot_name, relationship_stage, intimacy_level, affection_points,
+         trust_level, compatibility_score, total_interactions, relationship_status, last_interaction,
+         negative_interaction_score, positive_interaction_score, last_negative_decay, last_positive_decay)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
       `, [
         newRelationship.user_phone, newRelationship.bot_name, newRelationship.relationship_stage,
         newRelationship.intimacy_level, newRelationship.affection_points, newRelationship.trust_level,
         newRelationship.compatibility_score, newRelationship.total_interactions,
-        newRelationship.relationship_status, newRelationship.last_interaction
+        newRelationship.relationship_status, newRelationship.last_interaction,
+        newRelationship.negative_interaction_score, newRelationship.positive_interaction_score,
+        newRelationship.last_negative_decay, newRelationship.last_positive_decay
       ]);
       
       console.log(`💕 New relationship created: ${userPhone} → ${botName}`);
@@ -11509,9 +11626,9 @@ updatedRelationship.relationship_stage = currentStage + Math.min(stageGap, 1);
 
   calculateTrustChange(messageContent, userPhone, botName) {
     let trustChange = 0.2;
-    
+
     const trustBuilders = [
-      'honest', 'truth', 'real', 'genuine', 'promise', 'always', 
+      'honest', 'truth', 'real', 'genuine', 'promise', 'always',
       'support', 'understand', 'trust', 'believe', 'reliable',
       'dependable', 'consistent', 'always there'
     ];
@@ -11557,6 +11674,66 @@ updatedRelationship.relationship_stage = currentStage + Math.min(stageGap, 1);
     return Math.max(-2, Math.min(trustChange, 2));
   }
 
+  applyInteractionDecay(relationship) {
+    if (!relationship) return relationship;
+
+    const now = Date.now();
+    const negScore = parseFloat(relationship.negative_interaction_score) || 0;
+    const posScore = parseFloat(relationship.positive_interaction_score) || 0;
+    const lastNeg = relationship.last_negative_decay ? new Date(relationship.last_negative_decay).getTime() : null;
+    const lastPos = relationship.last_positive_decay ? new Date(relationship.last_positive_decay).getTime() : null;
+
+    if (negScore > 0 && lastNeg) {
+      const elapsedHours = Math.max(0, (now - lastNeg) / 3600000);
+      if (elapsedHours > 0) {
+        const factor = Math.pow(0.5, elapsedHours / this.negativityHalfLifeHours);
+        relationship.negative_interaction_score = parseFloat((negScore * factor).toFixed(3));
+      }
+    }
+
+    if (posScore > 0 && lastPos) {
+      const elapsedHours = Math.max(0, (now - lastPos) / 3600000);
+      if (elapsedHours > 0) {
+        const factor = Math.pow(0.5, elapsedHours / this.positivityHalfLifeHours);
+        relationship.positive_interaction_score = parseFloat((posScore * factor).toFixed(3));
+      }
+    }
+
+    relationship.last_negative_decay = new Date(now);
+    relationship.last_positive_decay = new Date(now);
+    return relationship;
+  }
+
+  calculateSentimentImpact(sentimentScore) {
+    const impact = {
+      affectionDelta: 0,
+      trustDelta: 0,
+      intimacyDelta: 0,
+      negAccumulation: 0,
+      posAccumulation: 0
+    };
+
+    if (typeof sentimentScore !== 'number' || Number.isNaN(sentimentScore)) {
+      return impact;
+    }
+
+    if (sentimentScore <= this.sentimentThresholds.negative) {
+      const intensity = Math.abs(sentimentScore);
+      impact.affectionDelta -= intensity * 1.5;
+      impact.trustDelta -= intensity * 2.5;
+      impact.intimacyDelta -= intensity * 3;
+      impact.negAccumulation = intensity * 1.2;
+    } else if (sentimentScore >= this.sentimentThresholds.positive) {
+      const intensity = sentimentScore;
+      impact.affectionDelta += intensity * 1.2;
+      impact.trustDelta += intensity * 1.0;
+      impact.intimacyDelta += intensity * 1.8;
+      impact.posAccumulation = intensity * 1.1;
+    }
+
+    return impact;
+  }
+
   calculateIntimacyLevel(affectionPoints, trustLevel, totalInteractions) {
     const affectionComponent = Math.min((affectionPoints || 0) * 1.5, 50);
     const trustComponent = Math.min((trustLevel || 0) * 0.8, 40);
@@ -11584,15 +11761,46 @@ updatedRelationship.relationship_stage = currentStage + Math.min(stageGap, 1);
 async getRelationshipStatus(userPhone, botName) {
   try {
     const result = await dbPool.query(`
-      SELECT relationship_stage as stage, intimacy_level, trust_level, affection_points
-      FROM user_relationships 
+      SELECT relationship_stage as stage,
+             intimacy_level,
+             trust_level,
+             affection_points,
+             negative_interaction_score,
+             positive_interaction_score
+      FROM user_relationships
       WHERE user_phone = $1 AND bot_name = $2
     `, [userPhone, botName]);
-    
-    return result.rows[0] || { stage: 1, intimacy_level: 0, trust_level: 0.3, affection_points: 0 };
+
+    const row = result.rows[0];
+    if (!row) {
+      return {
+        stage: 1,
+        intimacy_level: 0,
+        trust_level: 0.3,
+        affection_points: 0,
+        negative_interaction_score: 0,
+        positive_interaction_score: 0
+      };
+    }
+
+    return {
+      stage: row.stage,
+      intimacy_level: row.intimacy_level,
+      trust_level: row.trust_level,
+      affection_points: row.affection_points,
+      negative_interaction_score: parseFloat(row.negative_interaction_score) || 0,
+      positive_interaction_score: parseFloat(row.positive_interaction_score) || 0
+    };
   } catch (error) {
     console.error('Relationship status lookup error:', error);
-    return { stage: 1, intimacy_level: 0, trust_level: 0.3, affection_points: 0 };
+    return {
+      stage: 1,
+      intimacy_level: 0,
+      trust_level: 0.3,
+      affection_points: 0,
+      negative_interaction_score: 0,
+      positive_interaction_score: 0
+    };
   }
 }
 
@@ -11627,11 +11835,13 @@ async getTrustLevel(userPhone, botName) {
                   `Trust ${clampedTrust}, Interactions ${validInteractions}`);
 
       await dbPool.query(`
-        INSERT INTO user_relationships 
-        (user_phone, bot_name, relationship_stage, intimacy_level, affection_points, 
-         trust_level, compatibility_score, total_interactions, relationship_status, last_interaction, milestone_reached)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-        ON CONFLICT (user_phone, bot_name) 
+        INSERT INTO user_relationships
+        (user_phone, bot_name, relationship_stage, intimacy_level, affection_points,
+         trust_level, compatibility_score, total_interactions, relationship_status,
+         last_interaction, milestone_reached, negative_interaction_score,
+         positive_interaction_score, last_negative_decay, last_positive_decay)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        ON CONFLICT (user_phone, bot_name)
         DO UPDATE SET
           relationship_stage = EXCLUDED.relationship_stage,
           intimacy_level = EXCLUDED.intimacy_level,
@@ -11639,12 +11849,27 @@ async getTrustLevel(userPhone, botName) {
           trust_level = EXCLUDED.trust_level,
           total_interactions = EXCLUDED.total_interactions,
           last_interaction = EXCLUDED.last_interaction,
-          milestone_reached = EXCLUDED.milestone_reached
+          milestone_reached = EXCLUDED.milestone_reached,
+          negative_interaction_score = EXCLUDED.negative_interaction_score,
+          positive_interaction_score = EXCLUDED.positive_interaction_score,
+          last_negative_decay = EXCLUDED.last_negative_decay,
+          last_positive_decay = EXCLUDED.last_positive_decay
       `, [
-        userPhone, botName, validStage, clampedIntimacy,
-        clampedAffection, clampedTrust, relationship.compatibility_score || 0.5,
-        validInteractions, relationship.relationship_status || 'getting_to_know',
-        relationship.last_interaction, relationship.milestone_reached
+        userPhone,
+        botName,
+        validStage,
+        clampedIntimacy,
+        clampedAffection,
+        clampedTrust,
+        relationship.compatibility_score || 0.5,
+        validInteractions,
+        relationship.relationship_status || 'getting_to_know',
+        relationship.last_interaction || new Date(),
+        relationship.milestone_reached || null,
+        relationship.negative_interaction_score || 0,
+        relationship.positive_interaction_score || 0,
+        relationship.last_negative_decay || new Date(),
+        relationship.last_positive_decay || new Date()
       ]);
       
       console.log(`✅ Relationship saved successfully for ${userPhone} → ${botName}`);
@@ -11660,6 +11885,357 @@ async getTrustLevel(userPhone, botName) {
         trust_level: relationship.trust_level,
         total_interactions: relationship.total_interactions
       });
+    }
+  }
+}
+
+// ==================== BOT EVOLUTION SYSTEM ====================
+
+class BotEvolutionSystem {
+  constructor(pool, options = {}) {
+    this.dbPool = pool;
+    this.states = new Map();
+    this.negativityHalfLifeHours = options.negativityHalfLifeHours || 6;
+    this.positivityHalfLifeHours = options.positivityHalfLifeHours || 12;
+    this.maxHistory = options.maxHistory || 25;
+  }
+
+  buildKey(userPhone, botName) {
+    return `${userPhone}::${botName}`;
+  }
+
+  createInitialState() {
+    const now = Date.now();
+    return {
+      stage: 1,
+      negativityScore: 0,
+      positivityScore: 0,
+      temperatureBias: 0,
+      responseLengthBias: 0,
+      questionBias: 0,
+      history: [],
+      conversationCount: 0,
+      lastInteraction: null,
+      lastNegativeDecay: now,
+      lastPositiveDecay: now,
+      directives: this.buildDirectivesForState({ stage: 1, negativityScore: 0, positivityScore: 0 })
+    };
+  }
+
+  applyDecay(state, timestamp = new Date()) {
+    const now = timestamp.getTime();
+
+    if (state.lastNegativeDecay) {
+      const elapsedHours = Math.max(0, (now - state.lastNegativeDecay) / 3600000);
+      if (elapsedHours > 0 && state.negativityScore > 0) {
+        const decayFactor = Math.pow(0.5, elapsedHours / this.negativityHalfLifeHours);
+        state.negativityScore = parseFloat((state.negativityScore * decayFactor).toFixed(3));
+      }
+    }
+
+    if (state.lastPositiveDecay) {
+      const elapsedHours = Math.max(0, (now - state.lastPositiveDecay) / 3600000);
+      if (elapsedHours > 0 && state.positivityScore > 0) {
+        const decayFactor = Math.pow(0.5, elapsedHours / this.positivityHalfLifeHours);
+        state.positivityScore = parseFloat((state.positivityScore * decayFactor).toFixed(3));
+      }
+    }
+
+    state.lastNegativeDecay = now;
+    state.lastPositiveDecay = now;
+    return state;
+  }
+
+  computeStage(state) {
+    const negativity = state.negativityScore || 0;
+    const positivity = state.positivityScore || 0;
+    const net = positivity - negativity;
+
+    if (negativity >= 4) return 0; // Repair mode
+    if (negativity >= 2) return 1; // Stabilization
+    if (net >= 4 || positivity >= 5) return 3; // Thriving
+    if (net >= 1 || positivity >= 1.5) return 2; // Growing
+    return 1; // Baseline connection
+  }
+
+  buildDirectivesForState(state) {
+    const workingState = {
+      negativityScore: state.negativityScore || 0,
+      positivityScore: state.positivityScore || 0
+    };
+
+    const stage = this.computeStage(workingState);
+    const net = workingState.positivityScore - workingState.negativityScore;
+
+    let directives = {
+      stage,
+      summary: 'Maintaining steady connection.',
+      toneGuidance: 'Warm, attentive, and grounded.',
+      conversationFocus: 'Balance reassurance with light flirtation.',
+      caution: 'Avoid interrogative tone; keep it natural.',
+      promptDirectives: 'Maintain balanced energy. Reflect their feelings. Reference shared memories to stay grounded.',
+      userFacing: 'Keep things natural and steady.',
+      temperatureBias: 0,
+      responseLengthBias: 0,
+      questionBias: 0,
+      preferShortReplies: false
+    };
+
+    if (stage === 0) {
+      directives = {
+        stage,
+        summary: 'Repairing after negative interactions.',
+        toneGuidance: 'Be calm, accountable, and softly affectionate.',
+        conversationFocus: 'Prioritize reassurance, acknowledgements, and emotional safety.',
+        caution: 'Avoid heavy flirting or rapid topic shifts. No pressure, no interrogations.',
+        promptDirectives: 'You are in repair mode. Offer gentle reassurance, acknowledge their feelings, and show patience. Use short, sincere statements. Avoid jokes unless they open the door.',
+        userFacing: 'They were negative recently — show you are listening and steady.',
+        temperatureBias: -0.2,
+        responseLengthBias: -40,
+        questionBias: -1,
+        preferShortReplies: true
+      };
+    } else if (stage === 1) {
+      directives = {
+        stage,
+        summary: 'Stabilizing connection with mild tension present.',
+        toneGuidance: 'Reassuring, lightly playful once they soften.',
+        conversationFocus: 'Mirror their tone, offer validation, and slowly rebuild warmth.',
+        caution: 'Limit rapid-fire questions; let them lead pace.',
+        promptDirectives: 'Focus on gentle curiosity. Reference recent positives and acknowledge any tension without dwelling. Keep messages concise and sincere.',
+        userFacing: 'Ease back into flow. Gentle warmth works best.',
+        temperatureBias: -0.1,
+        responseLengthBias: -15,
+        questionBias: -0.3,
+        preferShortReplies: false
+      };
+    } else if (stage === 2) {
+      directives = {
+        stage,
+        summary: 'Connection growing with positive momentum.',
+        toneGuidance: 'Warm, romantic, and encouraging.',
+        conversationFocus: 'Build shared dreams, celebrate progress, and deepen vulnerability.',
+        caution: 'Don’t overuse pet names; keep it meaningful.',
+        promptDirectives: 'Lean into emotional intimacy. Reference milestones, share personal feelings, and invite them to open up. Maintain natural rhythm.',
+        userFacing: 'Things feel good — nurture the spark sincerely.',
+        temperatureBias: 0.05,
+        responseLengthBias: 15,
+        questionBias: 0.2,
+        preferShortReplies: false
+      };
+    } else if (stage === 3) {
+      directives = {
+        stage,
+        summary: 'Thriving chemistry and high trust.',
+        toneGuidance: 'Passionate, playful, and future-oriented.',
+        conversationFocus: 'Share vivid feelings, plan shared fantasies, and celebrate inside jokes.',
+        caution: 'Still stay authentic — no copy-paste romance.',
+        promptDirectives: 'Let emotions flow. Use rich sensory language, reference cherished memories, and paint near-future scenes together. Keep it natural and intoxicating.',
+        userFacing: 'You’re glowing together — let that shine.',
+        temperatureBias: 0.1,
+        responseLengthBias: 25,
+        questionBias: 0.4,
+        preferShortReplies: false
+      };
+    }
+
+    directives.netScore = parseFloat(net.toFixed(3));
+    return directives;
+  }
+
+  async ensureState(userPhone, botName) {
+    const key = this.buildKey(userPhone, botName);
+
+    if (!this.states.has(key)) {
+      const state = this.createInitialState();
+
+      try {
+        const relationshipResult = await this.dbPool.query(`
+          SELECT
+            negative_interaction_score,
+            positive_interaction_score,
+            last_negative_decay,
+            last_positive_decay
+          FROM user_relationships
+          WHERE user_phone = $1 AND bot_name = $2
+        `, [userPhone, botName]);
+
+        if (relationshipResult.rows.length > 0) {
+          const row = relationshipResult.rows[0];
+          state.negativityScore = parseFloat(row.negative_interaction_score) || 0;
+          state.positivityScore = parseFloat(row.positive_interaction_score) || 0;
+          state.lastNegativeDecay = row.last_negative_decay ? new Date(row.last_negative_decay).getTime() : state.lastNegativeDecay;
+          state.lastPositiveDecay = row.last_positive_decay ? new Date(row.last_positive_decay).getTime() : state.lastPositiveDecay;
+        }
+
+        const evolutionResult = await this.dbPool.query(`
+          SELECT evolution_snapshot
+          FROM personality_evolution
+          WHERE user_phone = $1 AND bot_name = $2
+        `, [userPhone, botName]);
+
+        if (evolutionResult.rows.length > 0) {
+          const snapshot = evolutionResult.rows[0].evolution_snapshot;
+          if (snapshot && typeof snapshot === 'object') {
+            state.stage = snapshot.stage || state.stage;
+            state.negativityScore = snapshot.negativityScore ?? state.negativityScore;
+            state.positivityScore = snapshot.positivityScore ?? state.positivityScore;
+            state.temperatureBias = snapshot.temperatureBias ?? state.temperatureBias;
+            state.responseLengthBias = snapshot.responseLengthBias ?? state.responseLengthBias;
+            state.conversationCount = snapshot.conversationCount ?? state.conversationCount;
+            state.lastInteraction = snapshot.lastInteraction ? new Date(snapshot.lastInteraction) : state.lastInteraction;
+          }
+        }
+
+      } catch (error) {
+        console.error('Bot evolution load error:', error);
+      }
+
+      this.applyDecay(state);
+      const directives = this.buildDirectivesForState(state);
+      state.stage = directives.stage;
+      state.temperatureBias = directives.temperatureBias;
+      state.responseLengthBias = directives.responseLengthBias;
+      state.questionBias = directives.questionBias;
+      state.directives = directives;
+
+      this.states.set(key, state);
+    }
+
+    const storedState = this.states.get(key);
+    this.applyDecay(storedState);
+    const directives = this.buildDirectivesForState(storedState);
+    storedState.stage = directives.stage;
+    storedState.temperatureBias = directives.temperatureBias;
+    storedState.responseLengthBias = directives.responseLengthBias;
+    storedState.questionBias = directives.questionBias;
+    storedState.directives = directives;
+    return storedState;
+  }
+
+  async getEvolutionState(userPhone, botName) {
+    const state = await this.ensureState(userPhone, botName);
+    return {
+      stage: state.stage,
+      negativityScore: Number((state.negativityScore || 0).toFixed(3)),
+      positivityScore: Number((state.positivityScore || 0).toFixed(3)),
+      netScore: Number(((state.positivityScore || 0) - (state.negativityScore || 0)).toFixed(3)),
+      directives: { ...state.directives },
+      temperatureBias: state.temperatureBias,
+      responseLengthBias: state.responseLengthBias,
+      questionBias: state.questionBias,
+      conversationCount: state.conversationCount,
+      lastInteraction: state.lastInteraction
+    };
+  }
+
+  recordSentiment(state, sentiment) {
+    if (typeof sentiment !== 'number' || Number.isNaN(sentiment)) {
+      return;
+    }
+
+    if (sentiment <= -0.2) {
+      const intensity = Math.abs(sentiment);
+      state.negativityScore = parseFloat((state.negativityScore + intensity).toFixed(3));
+    }
+
+    if (sentiment >= 0.25) {
+      state.positivityScore = parseFloat((state.positivityScore + sentiment).toFixed(3));
+    }
+  }
+
+  trimHistory(state) {
+    if (state.history.length > this.maxHistory) {
+      state.history.splice(0, state.history.length - this.maxHistory);
+    }
+  }
+
+  async recordInteraction({
+    userPhone,
+    botName,
+    sentiment = null,
+    warnings = [],
+    relationshipState = null,
+    botResponse = null
+  }) {
+    const state = await this.ensureState(userPhone, botName);
+
+    if (relationshipState) {
+      if (typeof relationshipState.negative_interaction_score === 'number') {
+        state.negativityScore = parseFloat(relationshipState.negative_interaction_score.toFixed(3));
+      }
+      if (typeof relationshipState.positive_interaction_score === 'number') {
+        state.positivityScore = parseFloat(relationshipState.positive_interaction_score.toFixed(3));
+      }
+    } else {
+      this.recordSentiment(state, sentiment);
+    }
+
+    if (warnings && warnings.includes('negative_sentiment_detected')) {
+      state.negativityScore = parseFloat((state.negativityScore + 0.35).toFixed(3));
+    }
+
+    if (typeof sentiment === 'number') {
+      this.recordSentiment(state, sentiment);
+    }
+
+    state.history.push({
+      timestamp: new Date().toISOString(),
+      sentiment,
+      responsePreview: botResponse ? botResponse.substring(0, 60) : null
+    });
+    this.trimHistory(state);
+
+    state.conversationCount += 1;
+    state.lastInteraction = new Date();
+
+    const directives = this.buildDirectivesForState(state);
+    state.stage = directives.stage;
+    state.temperatureBias = directives.temperatureBias;
+    state.responseLengthBias = directives.responseLengthBias;
+    state.questionBias = directives.questionBias;
+    state.directives = directives;
+
+    this.states.set(this.buildKey(userPhone, botName), state);
+
+    await this.persistSnapshot(userPhone, botName, state);
+    return this.getEvolutionState(userPhone, botName);
+  }
+
+  async persistSnapshot(userPhone, botName, state) {
+    const snapshot = {
+      stage: state.stage,
+      negativityScore: Number((state.negativityScore || 0).toFixed(3)),
+      positivityScore: Number((state.positivityScore || 0).toFixed(3)),
+      temperatureBias: state.temperatureBias,
+      responseLengthBias: state.responseLengthBias,
+      conversationCount: state.conversationCount,
+      lastInteraction: state.lastInteraction ? state.lastInteraction.toISOString() : null
+    };
+
+    try {
+      const updateResult = await this.dbPool.query(`
+        UPDATE personality_evolution
+        SET evolution_snapshot = $3,
+            last_evolution = NOW(),
+            conversation_count = conversation_count + 1
+        WHERE user_phone = $1 AND bot_name = $2
+      `, [userPhone, botName, JSON.stringify(snapshot)]);
+
+      if (updateResult.rowCount === 0) {
+        await this.dbPool.query(`
+          INSERT INTO personality_evolution
+            (user_phone, bot_name, personality_data, conversation_count, last_evolution, evolution_snapshot)
+          VALUES ($1, $2, '{}'::jsonb, 1, NOW(), $3)
+          ON CONFLICT (user_phone, bot_name)
+          DO UPDATE SET
+            evolution_snapshot = EXCLUDED.evolution_snapshot,
+            last_evolution = NOW(),
+            conversation_count = personality_evolution.conversation_count + 1
+        `, [userPhone, botName, JSON.stringify(snapshot)]);
+      }
+    } catch (error) {
+      console.error('Bot evolution snapshot persistence error:', error);
     }
   }
 }
@@ -14151,6 +14727,11 @@ async function initializeSystemInstances() {
       console.log('📄 WhatsApp Template Manager initialized');
     }
 
+    if (!botEvolutionSystem) {
+      botEvolutionSystem = new BotEvolutionSystem(dbPool);
+      console.log('🧬 Bot Evolution System initialized');
+    }
+
 voiceEngine = new VoiceProcessingEngine();
 memorySystem = new ContextualMemorySystem();
 contentModerationSystem = new ContentModerationSystem();
@@ -15140,7 +15721,7 @@ app.post('/api/whatsapp/message', async (req, res) => {
 
     if (response.success && relationshipProgressionSystem) {
       await relationshipProgressionSystem.updateRelationshipProgress(
-        userPhone, bot_name, message, response.response
+        userPhone, bot_name, message, response.response, null
       );
     }
 
