@@ -65,6 +65,7 @@ const multer = require('multer');
 const ffmpeg = require('fluent-ffmpeg');
 const cron = require('node-cron');
 const NodeCache = require('node-cache');
+const { EventEmitter } = require('events');
 
 // Express Application
 const app = express();
@@ -145,6 +146,10 @@ const CONFIG = {
   METRICS_ENABLED: true,
   HEALTH_CHECK_INTERVAL: 30000
 };
+
+const MAX_EVENT_LISTENERS = Math.max(32, (CONFIG.MAX_SESSIONS || 6) * 6);
+EventEmitter.defaultMaxListeners = Math.max(EventEmitter.defaultMaxListeners, MAX_EVENT_LISTENERS);
+process.setMaxListeners(EventEmitter.defaultMaxListeners);
 
 console.log("🔍 CURRENT DATABASE:", process.env.DATABASE_URL);
 
@@ -7273,6 +7278,10 @@ class EnterpriseSessionManager {
           ]
         }
       });
+
+      if (typeof client.setMaxListeners === 'function') {
+        client.setMaxListeners(MAX_EVENT_LISTENERS);
+      }
 
       sessionStatus.set(config.id, 'initializing');
       sessionRawQRs.set(config.id, '');
