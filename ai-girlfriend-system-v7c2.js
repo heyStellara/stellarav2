@@ -887,6 +887,8 @@ const SCHEMA_ALTER_STATEMENTS = [
   "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMP",
   "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS metadata JSONB",
   "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS template_name VARCHAR(100)",
+  "ALTER TABLE authorized_users ADD COLUMN IF NOT EXISTS payment_verified BOOLEAN DEFAULT false",
+  "ALTER TABLE authorized_users ADD COLUMN IF NOT EXISTS subscription_expires_at TIMESTAMP",
   "ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS variables JSONB DEFAULT '[]'",
   "ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS priority INTEGER DEFAULT 100",
   "ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS usage_count INTEGER DEFAULT 0",
@@ -895,6 +897,10 @@ const SCHEMA_ALTER_STATEMENTS = [
   "ALTER TABLE user_relationships ADD COLUMN IF NOT EXISTS positive_interaction_score DECIMAL(5,2) DEFAULT 0",
   "ALTER TABLE user_relationships ADD COLUMN IF NOT EXISTS last_negative_decay TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
   "ALTER TABLE user_relationships ADD COLUMN IF NOT EXISTS last_positive_decay TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+  "ALTER TABLE bots ADD COLUMN IF NOT EXISTS job_title VARCHAR(200)",
+  "ALTER TABLE bots ADD COLUMN IF NOT EXISTS profession VARCHAR(200)",
+  "ALTER TABLE bots ADD COLUMN IF NOT EXISTS workplace VARCHAR(300)",
+  "ALTER TABLE bots ADD COLUMN IF NOT EXISTS work_description TEXT",
   "ALTER TABLE personality_evolution ADD COLUMN IF NOT EXISTS evolution_snapshot JSONB"
 ];
 
@@ -1485,6 +1491,16 @@ async function initializeCompleteDatabase() {
     for (const query of indexQueries) {
       await dbPool.query(query);
       console.log(`✅ Created index: ${query.substring(0, 80)}...`);
+    }
+
+    // Drop and recreate views to ensure schema changes are applied cleanly
+    const dropViewQueries = [
+      "DROP VIEW IF EXISTS active_user_relationships"
+    ];
+
+    for (const query of dropViewQueries) {
+      await dbPool.query(query);
+      console.log(`✅ Dropped view (if existed): ${query}`);
     }
 
     // Create views
