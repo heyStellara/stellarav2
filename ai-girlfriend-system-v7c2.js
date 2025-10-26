@@ -64,7 +64,6 @@ const crypto = require('crypto');
 const multer = require('multer');
 const ffmpeg = require('fluent-ffmpeg');
 const cron = require('node-cron');
-const NodeCache = require('node-cache');
 const { EventEmitter } = require('events');
 
 // Express Application
@@ -7239,9 +7238,9 @@ class EnterpriseSessionManager {
   async initializeSessions() {
     console.log("🔍 DEBUG: initializeSessions called, starting session creation...");
     try {
-      await Promise.all(
-        this.sessionConfigs.map(config => this.createSession(config))
-      );
+      for (const config of this.sessionConfigs) {
+        await this.createSession(config);
+      }
       console.log(`📱 Initialized ${this.sessions.size} enterprise WhatsApp sessions`);
     } catch (error) {
       console.error('Session initialization error:', error);
@@ -7358,6 +7357,8 @@ class EnterpriseSessionManager {
         sessionStatus.set(config.id, 'connected');
       });
 
+      await client.initialize();
+
       this.attachUnifiedMessageHandler(client, config.id);
 
       this.sessions.set(config.id, {
@@ -7371,13 +7372,9 @@ class EnterpriseSessionManager {
       });
 
       console.log(`📱 Session ${config.id} created successfully with unified message handler attached`);
-
-      client.initialize().catch(err => {
-        console.error(`❌ Initialization error for ${config.id}:`, err);
-        sessionStatus.set(config.id, 'error');
-      });
     } catch (error) {
       console.error(`Failed to create session ${config.id}:`, error);
+      sessionStatus.set(config.id, 'error_initializing');
       throw error;
     }
   }
@@ -15582,6 +15579,7 @@ app.get('/api/sessions', (req, res) => {
       sessions: sessions,
       total_sessions: sessions.length,
       active_sessions: sessions.filter(s => s.status === 'connected').length,
+      cached: false,
       timestamp: new Date().toISOString()
     });
 
@@ -15616,6 +15614,7 @@ app.get('/api/qr-codes', (req, res) => {
       qrCodes: qrCodes,
       qrCodesRaw: qrCodesRaw,
       qrCodesAscii: qrCodesAscii,
+      cached: false,
       status: 'success',
       timestamp: new Date().toISOString()
     });
