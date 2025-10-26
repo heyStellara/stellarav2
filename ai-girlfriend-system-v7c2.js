@@ -64,11 +64,7 @@ const crypto = require('crypto');
 const multer = require('multer');
 const ffmpeg = require('fluent-ffmpeg');
 const cron = require('node-cron');
-
-// ==================== ADD RATE LIMITING AND CACHING IMPORTS ====================
-const rateLimit = require('express-rate-limit');
-const NodeCache = require('node-cache');
-// ==================== END NEW IMPORTS ====================
+const { EventEmitter } = require('events');
 
 // Express Application
 const app = express();
@@ -78,28 +74,6 @@ console.log('🚀 STELLARA AI COMPANION SYSTEM - FIXED VERSION');
 console.log('📊 System: AI Girlfriend Platform with 10 Cultural Personalities');
 console.log('👥 Capacity: 4,200 users across 6 enterprise sessions');
 console.log('🔧 Status: All syntax and schema issues resolved');
-
-// ==================== ADD CACHING AND RATE LIMITING CONFIGURATION ====================
-const qrCache = new NodeCache({ stdTTL: 8, checkperiod: 10 });
-const sessionCache = new NodeCache({ stdTTL: 5, checkperiod: 8 });
-
-// Create rate limiters
-const qrCodeLimiter = rateLimit({
-  windowMs: 5 * 1000,
-  max: 2,
-  message: 'Too many QR code requests, please slow down',
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-const sessionLimiter = rateLimit({
-  windowMs: 3 * 1000,
-  max: 3,
-  message: 'Too many session requests, please slow down',
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-// ==================== END CACHING AND RATE LIMITING CONFIGURATION ====================
 
 // ==================== ENHANCED CONFIGURATION SYSTEM ====================
 const CONFIG = {
@@ -172,6 +146,10 @@ const CONFIG = {
   HEALTH_CHECK_INTERVAL: 30000
 };
 
+const MAX_EVENT_LISTENERS = Math.max(32, (CONFIG.MAX_SESSIONS || 6) * 6);
+EventEmitter.defaultMaxListeners = Math.max(EventEmitter.defaultMaxListeners, MAX_EVENT_LISTENERS);
+process.setMaxListeners(EventEmitter.defaultMaxListeners);
+
 console.log("🔍 CURRENT DATABASE:", process.env.DATABASE_URL);
 
 // ==================== VOICE SETTINGS FOR EACH BOT ====================
@@ -215,11 +193,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// ==================== APPLY RATE LIMITING MIDDLEWARE ====================
-app.use('/api/qr-codes', qrCodeLimiter);
-app.use('/api/sessions', sessionLimiter);
-// ==================== END RATE LIMITING MIDDLEWARE ====================
-
 // ==================== DATABASE POOL CONFIGURATION ====================
 const dbPool = new Pool({
   connectionString: CONFIG.DATABASE_URL,
@@ -261,6 +234,8 @@ console.log('🤖 OpenAI gpt-4o-mini client initialized with proper API key');
 // ==================== GLOBAL STORAGE MAPS ====================
 const whatsappSessions = new Map();
 const sessionQRs = new Map();
+const sessionRawQRs = new Map();
+const sessionAsciiQRs = new Map();
 const sessionStatus = new Map();
 const userCooldowns = new Map();
 const activeConversations = new Map();
@@ -887,6 +862,8 @@ const SCHEMA_ALTER_STATEMENTS = [
   "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMP",
   "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS metadata JSONB",
   "ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS template_name VARCHAR(100)",
+  "ALTER TABLE authorized_users ADD COLUMN IF NOT EXISTS payment_verified BOOLEAN DEFAULT false",
+  "ALTER TABLE authorized_users ADD COLUMN IF NOT EXISTS subscription_expires_at TIMESTAMP",
   "ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS variables JSONB DEFAULT '[]'",
   "ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS priority INTEGER DEFAULT 100",
   "ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS usage_count INTEGER DEFAULT 0",
@@ -895,6 +872,10 @@ const SCHEMA_ALTER_STATEMENTS = [
   "ALTER TABLE user_relationships ADD COLUMN IF NOT EXISTS positive_interaction_score DECIMAL(5,2) DEFAULT 0",
   "ALTER TABLE user_relationships ADD COLUMN IF NOT EXISTS last_negative_decay TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
   "ALTER TABLE user_relationships ADD COLUMN IF NOT EXISTS last_positive_decay TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+  "ALTER TABLE bots ADD COLUMN IF NOT EXISTS job_title VARCHAR(200)",
+  "ALTER TABLE bots ADD COLUMN IF NOT EXISTS profession VARCHAR(200)",
+  "ALTER TABLE bots ADD COLUMN IF NOT EXISTS workplace VARCHAR(300)",
+  "ALTER TABLE bots ADD COLUMN IF NOT EXISTS work_description TEXT",
   "ALTER TABLE personality_evolution ADD COLUMN IF NOT EXISTS evolution_snapshot JSONB"
 ];
 
@@ -7267,123 +7248,116 @@ class EnterpriseSessionManager {
   }
 
   async createSession(config) {
-  console.log(`🔍 DEBUG: Creating session ${config.id}...`);
-  try {
-    const client = new Client({
-      authStrategy: new LocalAuth({
-        clientId: config.id,
-        dataPath: path.join(__dirname, 'whatsapp-sessions', config.id)
-      }),
-      puppeteer: {
-  headless: true,
-  args: [
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage',
-    '--disable-accelerated-2d-canvas',
-    '--no-first-run',
-    '--no-zygote',
-    '--single-process',
-    '--disable-gpu',
-    '--use-gl=egl',
-    '--disable-web-security',
-    '--allow-running-insecure-content',
-    '--disable-features=VizDisplayCompositor',
-    '--disable-software-rasterizer',
-    '--disable-background-timer-throttling',
-    '--disable-backgrounding-occluded-windows',
-    '--disable-renderer-backgrounding'
-  ]
-}
-    });
+    console.log(`🔍 DEBUG: Creating session ${config.id}...`);
+    try {
+      const client = new Client({
+        authStrategy: new LocalAuth({
+          clientId: config.id,
+          dataPath: path.join(__dirname, 'whatsapp-sessions', config.id)
+        }),
+        puppeteer: {
+          headless: true,
+          args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--no-first-run',
+            '--no-zygote',
+            '--single-process',
+            '--disable-gpu',
+            '--use-gl=egl',
+            '--disable-web-security',
+            '--allow-running-insecure-content',
+            '--disable-features=VizDisplayCompositor',
+            '--disable-software-rasterizer',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding'
+          ]
+        }
+      });
 
-    client.on('qr', async (qr) => {
-      try {
-        const qrCode = await QRCode.toDataURL(qr, {
-          errorCorrectionLevel: 'M',
-          type: 'image/png',
-          quality: 0.92,
-          margin: 4,
-          color: { dark: '#000000', light: '#FFFFFF' },
-          width: 512
-        });
-        
-        sessionQRs.set(config.id, qrCode);
-        sessionStatus.set(config.id, 'qr_ready');
-        
-        console.log(`📱 QR image generated for ${config.id} (${qrCode.length} chars visual data)`);
-        console.log(`🔍 Raw QR data length: ${qr.length} chars`);
-      } catch (error) {
-        console.error(`QR generation error for ${config.id}:`, error);
-        sessionQRs.set(config.id, qr);
+      if (typeof client.setMaxListeners === 'function') {
+        client.setMaxListeners(MAX_EVENT_LISTENERS);
       }
-    });
 
-    // ==================== ADD RECONNECTION LOGIC HERE ====================
-    client.on('auth_failure', msg => {
-      console.error(`❌ AUTH FAILURE for ${config.id}:`, msg);
-      sessionStatus.set(config.id, 'auth_failed');
-      
-      // Retry after 10 seconds
-      setTimeout(() => {
-        console.log(`🔄 Retrying authentication for ${config.id}...`);
-        client.initialize().catch(err => {
-          console.error(`❌ Retry failed for ${config.id}:`, err);
-        });
-      }, 10000);
-    });
+      sessionStatus.set(config.id, 'initializing');
+      sessionRawQRs.set(config.id, '');
+      sessionAsciiQRs.set(config.id, '');
 
-    client.on('disconnected', (reason) => {
-      console.log(`🔌 DISCONNECTED: ${config.id} -`, reason);
-      sessionStatus.set(config.id, 'disconnected');
-      
-      // Auto-reconnect after 5 seconds
-      setTimeout(() => {
-        console.log(`🔄 Attempting to reconnect ${config.id}...`);
-        client.initialize().catch(err => {
-          console.error(`❌ Reconnection failed for ${config.id}:`, err);
-        });
-      }, 5000);
-    });
+      client.on('qr', async (qr) => {
+        try {
+          const [qrCode, ascii] = await Promise.all([
+            QRCode.toDataURL(qr, {
+              errorCorrectionLevel: 'M',
+              type: 'image/png',
+              quality: 0.92,
+              margin: 4,
+              color: { dark: '#000000', light: '#FFFFFF' },
+              width: 512
+            }),
+            QRCode.toString(qr, { type: 'terminal' })
+          ]);
 
-    client.on('authenticated', () => {
-      console.log(`✅ AUTHENTICATED: ${config.id} authenticated successfully`);
-      sessionStatus.set(config.id, 'authenticated');
-    });
+          sessionQRs.set(config.id, qrCode);
+          sessionRawQRs.set(config.id, qr);
+          sessionAsciiQRs.set(config.id, ascii);
+          sessionStatus.set(config.id, 'qr_ready');
 
-    client.on('ready', () => {
-      console.log(`✅ READY: ${config.id} is now connected and ready`);
-      sessionStatus.set(config.id, 'connected');
-    });
-    // ==================== END RECONNECTION LOGIC ====================
+          console.log(`📱 QR image generated for ${config.id} (${qrCode.length} chars visual data)`);
+          console.log(`🔍 Raw QR data length: ${qr.length} chars`);
+          console.log(ascii);
+        } catch (error) {
+          console.error(`QR generation error for ${config.id}:`, error);
+          sessionQRs.set(config.id, qr);
+          sessionRawQRs.set(config.id, qr);
+          try {
+            const asciiFallback = await QRCode.toString(qr, { type: 'terminal' });
+            sessionAsciiQRs.set(config.id, asciiFallback);
+            console.log(asciiFallback);
+          } catch (asciiError) {
+            console.error(`QR ASCII fallback error for ${config.id}:`, asciiError);
+            sessionAsciiQRs.set(config.id, '');
+          }
+        }
+      });
 
-    client.on('ready', () => {
-      sessionStatus.set(config.id, 'connected');
-      console.log(`📱 Session ${config.id} connected and ready`);
-    });
+      client.on('auth_failure', msg => {
+        console.error(`❌ AUTH FAILURE for ${config.id}:`, msg);
+        sessionStatus.set(config.id, 'auth_failed');
 
-    client.on('authenticated', () => {
-      sessionStatus.set(config.id, 'authenticated');
-      console.log(`📱 Session ${config.id} authenticated`);
-    });
+        setTimeout(() => {
+          console.log(`🔄 Retrying authentication for ${config.id}...`);
+          client.initialize().catch(err => {
+            console.error(`❌ Retry failed for ${config.id}:`, err);
+          });
+        }, 10000);
+      });
 
-    client.on('auth_failure', (msg) => {
-      sessionStatus.set(config.id, 'auth_failed');
-      console.error(`📱 Auth failure for ${config.id}:`, msg);
-    });
+      client.on('disconnected', (reason) => {
+        console.log(`🔌 DISCONNECTED: ${config.id} -`, reason);
+        sessionStatus.set(config.id, 'disconnected');
 
-    client.on('disconnected', (reason) => {
-      sessionStatus.set(config.id, 'disconnected');
-      console.log(`📱 Session ${config.id} disconnected:`, reason);
-      console.log(`♻️ Attempting to reconnect session ${config.id} in 5 seconds...`);
-      setTimeout(() => {
-        client.initialize().catch(err => {
-          console.error(`❌ Failed to reconnect session ${config.id}:`, err);
-        });
-      }, 5000);
-    });
+        setTimeout(() => {
+          console.log(`🔄 Attempting to reconnect ${config.id}...`);
+          client.initialize().catch(err => {
+            console.error(`❌ Reconnection failed for ${config.id}:`, err);
+          });
+        }, 5000);
+      });
 
-    await client.initialize();
+      client.on('authenticated', () => {
+        console.log(`✅ AUTHENTICATED: ${config.id} authenticated successfully`);
+        sessionStatus.set(config.id, 'authenticated');
+      });
+
+      client.on('ready', () => {
+        console.log(`✅ READY: ${config.id} is now connected and ready`);
+        sessionStatus.set(config.id, 'connected');
+      });
+
+      await client.initialize();
 
       this.attachUnifiedMessageHandler(client, config.id);
 
@@ -7398,9 +7372,9 @@ class EnterpriseSessionManager {
       });
 
       console.log(`📱 Session ${config.id} created successfully with unified message handler attached`);
-
     } catch (error) {
       console.error(`Failed to create session ${config.id}:`, error);
+      sessionStatus.set(config.id, 'error_initializing');
       throw error;
     }
   }
@@ -15572,13 +15546,6 @@ app.get('/api/health', (req, res) => {
 
 app.get('/api/sessions', (req, res) => {
   try {
-    // Check cache first
-    const cachedSessions = sessionCache.get('sessions');
-    if (cachedSessions) {
-      console.log('📦 Serving sessions from cache');
-      return res.json(cachedSessions);
-    }
-
     if (!enterpriseSessionManager) {
       return res.status(503).json({
         success: false,
@@ -15589,33 +15556,32 @@ app.get('/api/sessions', (req, res) => {
     const sessions = [];
     enterpriseSessionManager.sessionConfigs.forEach(config => {
       const qr = sessionQRs.get(config.id) || '';
+      const rawQr = sessionRawQRs.get(config.id) || '';
+      const asciiQr = sessionAsciiQRs.get(config.id) || '';
       const status = sessionStatus.get(config.id) || 'initializing';
-      
+
       sessions.push({
         id: config.id,
         region: config.region,
         capacity: config.capacity,
         qr_code: qr,
+        qr_code_raw: rawQr,
+        qr_code_ascii: asciiQr,
         status: status,
         qr_length: qr.length,
+        qr_raw_length: rawQr.length,
         last_updated: new Date().toISOString()
       });
     });
 
-    const response = {
+    res.json({
       success: true,
       sessions: sessions,
       total_sessions: sessions.length,
       active_sessions: sessions.filter(s => s.status === 'connected').length,
       cached: false,
       timestamp: new Date().toISOString()
-    };
-
-    // Cache the response for 5 seconds
-    sessionCache.set('sessions', response);
-    console.log('🔄 Sessions cached for 5 seconds');
-
-    res.json(response);
+    });
 
   } catch (error) {
     console.error('Sessions endpoint error:', error);
@@ -15629,34 +15595,29 @@ app.get('/api/sessions', (req, res) => {
 
 app.get('/api/qr-codes', (req, res) => {
   try {
-    // Check cache first
-    const cachedQrCodes = qrCache.get('qr-codes');
-    if (cachedQrCodes) {
-      console.log('📦 Serving QR codes from cache');
-      return res.json(cachedQrCodes);
-    }
-
     const qrCodes = {};
-    
+    const qrCodesRaw = {};
+    const qrCodesAscii = {};
+
     if (enterpriseSessionManager) {
       enterpriseSessionManager.sessionConfigs.forEach(config => {
         const qr = sessionQRs.get(config.id) || '';
+        const rawQr = sessionRawQRs.get(config.id) || '';
+        const asciiQr = sessionAsciiQRs.get(config.id) || '';
         qrCodes[config.id] = qr;
+        qrCodesRaw[config.id] = rawQr;
+        qrCodesAscii[config.id] = asciiQr;
       });
     }
 
-    const response = {
+    res.json({
       qrCodes: qrCodes,
-      status: 'success',
+      qrCodesRaw: qrCodesRaw,
+      qrCodesAscii: qrCodesAscii,
       cached: false,
+      status: 'success',
       timestamp: new Date().toISOString()
-    };
-
-    // Cache the response for 8 seconds
-    qrCache.set('qr-codes', response);
-    console.log('🔄 QR codes cached for 8 seconds');
-
-    res.json(response);
+    });
 
   } catch (error) {
     console.error('QR codes endpoint error:', error);
